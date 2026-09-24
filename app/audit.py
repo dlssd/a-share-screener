@@ -143,7 +143,8 @@ def build_market_audit(trade_date: str, *, force: bool=False) -> tuple[list[dict
     universe=list({r["symbol"]:r for r in universe}.values())
     theoretical={r["symbol"] for r in universe if r["detection_status"]=="OK"}
     common=theoretical & pool_symbols; only_theory=sorted(theoretical-pool_symbols); only_pool=sorted(pool_symbols-theoretical)
-    board_counts={m:sum(1 for r in universe if r["market"]==m) for m in ("MAIN","CHINEXT","STAR","BSE")}
+    board_counts={m:sum(1 for r in universe if r["market"]==m and r["detection_status"]=="OK")
+                  for m in ("MAIN","CHINEXT","STAR","BSE")}
     report={"status":"WARNING" if unknown or status=="WARNING" or only_pool else "SUCCESS","market_rows":market_rows,
       "theoretical_rows":len(theoretical),"pool_rows":len(pool),"common_rows":len(common),
       "only_theoretical":only_theory,"only_pool":only_pool,"main_rows":board_counts["MAIN"],
