@@ -1,0 +1,21 @@
+services:
+  web:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /data/screener.db
+    volumes:
+      - ./data:/data
+    ports:
+      - "8000:8000"
+
+  scheduler:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /data/screener.db
+    volumes:
+      - ./data:/data
+    command: ["python", "-m", "app.scheduler"]

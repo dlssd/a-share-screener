@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>A股低位多涨停筛选器</title>
+  <style>
+    :root { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:#111827; background:#f7f7f8; }
+    body { margin:0; }
+    .wrap { max-width:1180px; margin:0 auto; padding:28px 20px 60px; }
+    h1 { margin:0 0 8px; font-size:26px; }
+    .sub { color:#6b7280; margin-bottom:20px; line-height:1.6; }
+    .status { background:white; border:1px solid #e5e7eb; border-radius:14px; padding:14px 16px; margin-bottom:16px; display:flex; gap:24px; flex-wrap:wrap; }
+    .ok { color:#067647; font-weight:650; } .warn { color:#b54708; font-weight:650; }
+    .bad { color:#b42318; font-weight:650; }
+    table { width:100%; border-collapse:separate; border-spacing:0; background:white; border:1px solid #e5e7eb; border-radius:14px; overflow:hidden; }
+    th,td { padding:12px 10px; border-bottom:1px solid #eef0f2; text-align:right; white-space:nowrap; }
+    th { background:#fafafa; color:#4b5563; font-size:13px; }
+    th:first-child,td:first-child,th:nth-child(2),td:nth-child(2),th:nth-child(3),td:nth-child(3) { text-align:left; }
+    tr:last-child td { border-bottom:none; }
+    .name { font-weight:700; }
+    .tag { display:inline-block; padding:3px 8px; border-radius:999px; background:#f3f4f6; font-size:12px; color:#4b5563; }
+    button { border:1px solid #d1d5db; background:white; border-radius:8px; padding:5px 8px; cursor:pointer; }
+    button:hover { background:#f3f4f6; }
+    .empty { padding:40px; text-align:center; color:#6b7280; background:white; border-radius:14px; border:1px solid #e5e7eb; }
+    .rules { margin-top:16px; color:#6b7280; font-size:13px; line-height:1.7; }
+    @media (max-width:900px) { .table-wrap { overflow-x:auto; } }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>A股低位多涨停筛选器</h1>
+  <div class="sub">只负责每天稳定筛出候选；K线和题材继续去同花顺 / 开盘啦复盘。</div>
+
+  <div class="status">
+    {% if latest %}
+      <div>扫描交易日：{{ latest.trade_date[:4] }}-{{ latest.trade_date[4:6] }}-{{ latest.trade_date[6:] }}</div>
+      <div>当前时间：{{ latest.current_time or '-' }}</div>
+      <div>数据状态：<span class="{% if latest.status == 'SUCCESS' %}ok{% elif latest.status == 'WARNING' %}warn{% else %}bad{% endif %}">{{ latest.status }}</span></div>
+      <div>抓取时间 {{ latest.fetched_at or '-' }}</div>
+      <div>AKShare/东方财富涨停池：{{ latest.akshare_status }} · 腾讯/新浪历史：{{ latest.history_status or 'NOT_RUN' }}</div>
+      {% if latest.message %}<div class="{% if latest.status == 'FAILED' %}bad{% endif %}">{{ latest.message }}</div>{% endif %}
+    {% else %}
+      <div class="bad">尚未完成首次数据同步</div>
+    {% endif %}
+  </div>
+
+  {% if latest %}
+  <div class="status">
+    <div>筛选漏斗：</div><div>今日涨停 {{ latest.pool_rows }} 只</div><div>市值≥{{ settings.market_cap_min_yi|int }}亿 {{ latest.cap_rows }} 只</div>
+    <div>最近20日≥2次涨停 {{ latest.repeated_rows }} 只</div><div>排除连续涨停 {{ latest.nonconsecutive_rows }} 只</div>
+    <div>250日低位 {{ latest.low_rows }} 只</div><div>满足回撤 {{ latest.pullback_rows }} 只</div><div>最终候选 {{ latest.candidate_rows }} 只</div>
+  </div>
+  {% endif %}
+
+  {% if rows %}
+  <div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>代码</th><th>名称</th><th>行业</th><th>收盘</th><th>总市值(亿)</th>
+        <th>20日涨停</th><th>涨停日期</th><th>250日位置</th><th>距250日低点</th><th>前次涨停后回撤</th><th>20日涨幅</th><th>数据核验</th><th>复制</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for r in rows %}
+      <tr>
+        <td>{{ r.symbol }}</td>
+        <td class="name">{{ r.name }}</td>
+        <td><span class="tag">{{ r.industry or '-' }}</span></td>
+        <td>{{ '%.2f'|format(r.close) }}</td>
+        <td>{{ '%.1f'|format(r.total_market_cap_yi) }}</td>
+        <td>{{ r.limit_up_count }}</td>
+        <td>{{ r.limit_dates|join(' / ') }}</td>
+        <td>{{ '%.1f%%'|format(r.low_position_pct*100) }}</td>
+        <td>{{ '%.1f%%'|format(r.distance_from_low_pct*100) }}</td>
+        <td>{% if r.pullback_pct is not none %}{{ '%.1f%%'|format(r.pullback_pct*100) }}{% else %}-{% endif %}</td>
+        <td>{% if r.recent_return_pct is not none %}{{ '%.1f%%'|format(r.recent_return_pct*100) }}{% else %}-{% endif %}</td>
+        <td class="{% if r.verification_status == 'DATA_MISMATCH' %}bad{% else %}ok{% endif %}" title="{{ r.verification_message or '' }}">{{ r.verification_status }}</td>
+        <td>
+          <button onclick='copyText({{ r.name|tojson }})'>名称</button>
+          <button onclick='copyText({{ r.symbol|tojson }})'>代码</button>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+    <div class="empty">{% if latest and latest.status == 'FAILED' %}<span class="bad">本次数据失败，未生成正式候选：{{ latest.message }}</span>{% elif latest and latest.status == 'WARNING' and 'DATA_MISSING' in (latest.message or '') %}<span class="warn">必要历史数据不完整，本次未发布正式候选。</span>{% else %}{{ chosen_date or '暂无日期' }} 没有符合当前规则的股票。{% endif %}</div>
+  {% endif %}
+
+  <div class="rules">
+    当前默认：当日涨停、市值≥{{ settings.market_cap_min_yi|int }}亿、最近{{ settings.recent_trading_days }}个交易日涨停≥{{ settings.min_limit_ups }}次、无连续涨停、复权后{{ settings.low_window_days }}日区间位置≤{{ '%.0f%%'|format(settings.max_low_position*100) }}、前一次涨停后有回撤。所有阈值都可以在 .env 修改。
+  </div>
+</div>
+<script>
+async function copyText(text) {
+  await navigator.clipboard.writeText(text);
+}
+</script>
+</body>
+</html>
