@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import secrets
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -12,10 +14,12 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.templating import Jinja2Templates
 
 from .config import settings
-from .db import connect, init_db, latest_run, run_for_date, scanned_dates
-from .sync import resolve_latest_completed_trade_date, sync_market_day
+from .db import (active_run_for_date, connect, get_news_cache, init_db, published_dates,
+                 published_run_for_date, save_news_cache, stage_rows_for_run)
+from .datasource import AKShareSource
+from .sync import DataValidationError, sync_market_day
 
-app = FastAPI(title="A股低位多涨停筛选器", version="0.5.0")
+app = FastAPI(title="A股低位多涨停筛选器", version="0.6.0")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 security = HTTPBasic(auto_error=False)
 refresh_lock = threading.Lock()
@@ -62,8 +66,10 @@ def _rows_for_date(trade_date: str) -> list[dict]:
 
 
 def _stage_rows_for_date(trade_date: str) -> list[dict]:
-    with connect() as conn:
-        rows=conn.execute("SELECT * FROM scan_stage_results WHERE trade_date=?",(trade_date,)).fetchall()
+    published=published_run_for_date(trade_date)
+    if not published:
+        return []
+    rows=stage_rows_for_run(int(published["run_id"]))
     out=[]
     boolean_fields=("has_consecutive_limit_up","passes_market_cap","passes_repeat_limit",
                     "passes_nonconsecutive","passes_low","passes_pullback",
@@ -90,11 +96,12 @@ def _watch_score(row: dict) -> tuple:
 
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(auth)])
 def index(request: Request, date: Optional[str] = None):
-    latest=latest_run(); dates=scanned_dates()
-    chosen=(date or (latest["trade_date"] if latest else None))
+    dates=published_dates()
+    chosen=(date or (dates[-1] if dates else None))
     if chosen not in dates and dates: chosen=dates[-1]
-    selected=run_for_date(chosen) if chosen else None
-    valid=bool(selected and selected["status"] in ("SUCCESS","WARNING"))
+    selected=published_run_for_date(chosen) if chosen else None
+    active=active_run_for_date(chosen) if chosen else None
+    valid=bool(selected)
     stages=_stage_rows_for_date(chosen) if chosen and valid else []
     official=[r for r in stages if r["passes_final"]]
     watch=sorted((r for r in stages if r["passes_nonconsecutive"] and not r["passes_final"]),key=_watch_score)
@@ -107,6 +114,9 @@ def index(request: Request, date: Optional[str] = None):
             "official":official,"watch":watch,"repeated":repeated,"cap_rows":stages,
             "chosen_date": chosen,
             "selected":dict(selected) if selected else None,
+            "active":dict(active) if active else None,
+            "refreshing":bool(active and active["status"]=="RUNNING" and (not selected or active["run_id"]!=selected["run_id"])),
+            "refresh_failed":bool(active and active["status"]=="FAILED" and selected and active["run_id"]!=selected["run_id"]),
             "previous_date":dates[index_pos-1] if index_pos>0 else None,
             "next_date":dates[index_pos+1] if 0<=index_pos<len(dates)-1 else None,
             "settings": settings,
@@ -116,24 +126,30 @@ def index(request: Request, date: Optional[str] = None):
 
 @app.get("/api/results", dependencies=[Depends(auth)])
 def api_results(date: Optional[str] = None):
-    latest = latest_run()
-    chosen = date or (latest["trade_date"] if latest else None)
-    failed = bool(latest and chosen == latest["trade_date"] and latest["status"] == "FAILED")
-    return {"trade_date": chosen, "status": latest["status"] if latest else "NOT_RUN",
-            "rows": _rows_for_date(chosen) if chosen and not failed else []}
+    dates=published_dates(); chosen=date or (dates[-1] if dates else None)
+    published=published_run_for_date(chosen) if chosen else None
+    rows=[]
+    if published:
+        rows=[r for r in _stage_rows_for_date(chosen) if r["passes_final"]]
+    return {"trade_date":chosen,"status":published["status"] if published else "NOT_RUN","rows":rows}
 
 
 @app.post("/api/refresh", dependencies=[Depends(auth)])
-def refresh_latest():
+def refresh_latest(date: Optional[str] = None):
     if not refresh_lock.acquire(blocking=False):
         return JSONResponse({"ok":False,"message":"数据正在抓取，请稍候。"},status_code=409)
     try:
-        trade_date=resolve_latest_completed_trade_date()
+        trade_date=(date or (published_dates()[-1] if published_dates() else None))
+        if not trade_date or len(trade_date.replace("-","")) != 8:
+            return JSONResponse({"ok":False,"message":"请先选择一个已有的交易日。"},status_code=400)
+        trade_date=trade_date.replace("-","")
         sync_market_day(trade_date,run_scan=True,force=True)
-        run=run_for_date(trade_date)
-        if not run or run["status"]=="FAILED":
+        run=published_run_for_date(trade_date)
+        if not run:
             return JSONResponse({"ok":False,"message":"关键数据缺失，本次未生成可信复盘结果。"},status_code=503)
         return {"ok":True,"trade_date":trade_date,"status":run["status"]}
+    except DataValidationError as exc:
+        return JSONResponse({"ok":False,"message":str(exc)},status_code=400)
     except Exception as exc:
         return JSONResponse({"ok":False,"message":"重新抓取失败，请稍后再试或检查行情网络直连设置。",
                              "detail":f"{type(exc).__name__}: {exc}"},status_code=503)
@@ -141,9 +157,24 @@ def refresh_latest():
         refresh_lock.release()
 
 
+@app.get("/api/news/{symbol}", dependencies=[Depends(auth)])
+def news(symbol: str):
+    symbol=str(symbol).zfill(6)
+    query_date=datetime.now(ZoneInfo(settings.timezone)).strftime("%Y%m%d")
+    cached=get_news_cache(symbol,query_date)
+    if cached:
+        return {"symbol":symbol,"cached":True,"items":json.loads(cached["news_json"])}
+    try:
+        items=AKShareSource().news(symbol)
+        save_news_cache(symbol,query_date,items,"akshare_stock_news_em")
+        return {"symbol":symbol,"cached":False,"items":items}
+    except Exception:
+        return JSONResponse({"symbol":symbol,"message":"资讯暂时无法获取"},status_code=502)
+
+
 @app.get("/healthz")
 def healthz():
-    latest = latest_run()
+    dates=published_dates(); latest=published_run_for_date(dates[-1]) if dates else None
     return {"ok": bool(latest and latest["status"] in ("SUCCESS","WARNING")),
             "latest_trade_date": latest["trade_date"] if latest else None,
             "status": latest["status"] if latest else "NOT_RUN"}

@@ -172,17 +172,73 @@ class AKShareSource:
 
     @staticmethod
     def market_symbol(symbol: str) -> str:
-        return ("sh" if symbol.startswith(("5", "6", "9")) else "sz") + symbol
+        symbol=str(symbol).zfill(6)
+        if symbol.startswith("9"):
+            return "bj" + symbol
+        return ("sh" if symbol.startswith(("5","6")) else "sz") + symbol
+
+    def news(self, symbol: str) -> list[dict]:
+        """Fetch on demand only; caller owns caching and presentation."""
+        def fetch():
+            import akshare as ak
+            with _requests_timeout(settings.request_timeout):
+                return ak.stock_news_em(symbol=str(symbol).zfill(6))
+        raw=_retry(f"AKShare news {symbol}",fetch)
+        if raw is None or raw.empty:
+            return []
+        columns={str(c):c for c in raw.columns}
+        def pick(*names):
+            for name in names:
+                if name in columns: return columns[name]
+            return None
+        title=pick("新闻标题","标题","title"); published=pick("发布时间","发布时间"); source=pick("文章来源","来源")
+        if not title: return []
+        result=[]
+        for _, row in raw.head(5).iterrows():
+            result.append({"title":str(row.get(title,"")),"published_at":str(row.get(published,"")) if published else "",
+                           "source":str(row.get(source,"")) if source else ""})
+        return result
 
     def tencent_history(self, symbol: str, start_date: str, end_date: str, *, adjusted: bool) -> pd.DataFrame:
         def fetch():
             import akshare as ak
+            if str(symbol).zfill(6).startswith("9"):
+                return self._tencent_bse_history(symbol,start_date,end_date,adjusted)
             with _requests_timeout(settings.request_timeout):
                 return ak.stock_zh_a_hist_tx(
                     symbol=self.market_symbol(symbol), start_date=start_date, end_date=end_date,
                     adjust="qfq" if adjusted else "", timeout=settings.request_timeout)
         raw = _retry(f"Tencent history {symbol}", fetch)
         return self._normalize_history(raw, symbol, "tencent", adjusted)
+
+    @staticmethod
+    def _tencent_bse_history(symbol: str, start_date: str, end_date: str, adjusted: bool) -> pd.DataFrame:
+        """Tencent's public endpoint supports BJ symbols, while AKShare's
+        year-loop parser can fail when one year has a different response shape.
+        Keep the same endpoint and normalize only this provider edge case.
+        """
+        import requests
+        from akshare.utils import demjson
+        key="bj"+str(symbol).zfill(6)
+        url="https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
+        rows=[]
+        with _market_session() as session:
+            for year in range(int(start_date[:4]),int(end_date[:4])+1):
+                params={"_var":f"kline_day{year}","param":f"{key},day,{year}-01-01,{year+1}-12-31,640,{('qfq' if adjusted else '')}","r":"0.8205512681390605"}
+                response=session.get(url,params=params,timeout=settings.request_timeout)
+                response.raise_for_status()
+                payload=demjson.decode(response.text[response.text.find("={")+1:])
+                data=payload.get("data",{}).get(key,{})
+                series=data.get("qfqday" if adjusted else "day") or data.get("day") or data.get("hfqday") or []
+                rows.extend(series)
+        frame=pd.DataFrame(rows)
+        if frame.empty:
+            raise DataSourceError(f"Tencent history {symbol}: empty BJ response")
+        frame=frame.iloc[:,[0,1,2,3,4,5,7,8]]
+        frame.columns=["date","open","close","high","low","volume","turnover","amount"]
+        frame["date"]=pd.to_datetime(frame["date"],errors="coerce")
+        frame=frame[(frame["date"]>=pd.to_datetime(start_date)) & (frame["date"]<=pd.to_datetime(end_date))]
+        return frame.reset_index(drop=True)
 
     def sina_history(self, symbol: str, start_date: str, end_date: str, *, adjusted: bool) -> pd.DataFrame:
         def fetch():

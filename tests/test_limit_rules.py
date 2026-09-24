@@ -2,6 +2,7 @@ import pandas as pd
 import pytest
 
 from app.limit_rules import detect_limit_up_days, market_for_symbol, theoretical_limit_price
+from app.datasource import AKShareSource
 
 
 def test_board_classification():
@@ -25,3 +26,7 @@ def test_detects_board_specific_limit(symbol,close):
 def test_adjusted_close_rejected_for_limit_detection():
     with pytest.raises(ValueError):
         detect_limit_up_days(pd.DataFrame({"trade_date":["20260922"],"adjusted_close":[10]}),"600000")
+
+
+def test_tencent_bse_symbol_uses_bj_prefix():
+    assert AKShareSource.market_symbol("920748") == "bj920748"

@@ -8,7 +8,8 @@ import pandas as pd
 from .audit import build_market_audit
 from .config import settings
 from .datasource import AKShareSource
-from .db import connect, init_db, mark_pipeline_finish, mark_pipeline_start, pipeline_success, save_stage_results
+from .db import (connect, fail_scan_run, finish_scan_run, get_industry_cache, init_db,
+                 pipeline_success, save_industry_cache, start_scan_run)
 from .limit_rules import INSUFFICIENT_HISTORY, UNKNOWN_LIMIT_RULE, detect_limit_up_days
 from .scanner import ScanParams, evaluate_stages, has_consecutive_limit_ups, verify_independent_source
 
@@ -51,12 +52,32 @@ def _history(source: AKShareSource, symbol: str, target: str, provider: str, adj
     return frame
 
 
+def _industry_for(source: AKShareSource, row: dict, warnings: list[str]) -> str | None:
+    value=row.get("industry")
+    if value is not None and str(value).strip() and str(value).strip().lower() not in {"nan","none"}:
+        return str(value).strip()
+    symbol=str(row["symbol"])
+    cached=get_industry_cache(symbol)
+    if cached:
+        return cached["industry"]
+    try:
+        info=source.individual_info(symbol)
+        value=info.get("行业") or info.get("所属行业")
+        value=str(value).strip() if value is not None else None
+    except Exception as exc:
+        value=None
+        warnings.append(f"{symbol} 行业获取失败: {type(exc).__name__}")
+    save_industry_cache(symbol,str(row.get("name", "")),value,"akshare_individual_info")
+    return value
+
+
 def sync_market_day(trade_date: str, *, run_scan: bool=True, force: bool=False) -> int:
     init_db(); source=AKShareSource(); now=shanghai_now(); latest=resolve_latest_completed_trade_date(source,now)
     if trade_date>latest: raise DataValidationError(f"{trade_date} 尚非完整盘后交易日；最近完整日为 {latest}")
     if pipeline_success(trade_date) and not force:
         with connect() as conn: return int(conn.execute("SELECT candidate_rows FROM pipeline_runs WHERE trade_date=?",(trade_date,)).fetchone()[0])
-    mark_pipeline_start(trade_date); current_time=now.strftime("%Y-%m-%d %H:%M Asia/Shanghai")
+    current_time=now.strftime("%Y-%m-%d %H:%M Asia/Shanghai")
+    run_id=start_scan_run(trade_date,current_time)
     counts={k:0 for k in ("pool_rows","cap_rows","repeated_rows","nonconsecutive_rows","low_rows","pullback_rows","pattern_rows","candidate_rows")}
     warnings=[]; history_status="PENDING"
     try:
@@ -70,6 +91,7 @@ def sync_market_day(trade_date: str, *, run_scan: bool=True, force: bool=False) 
         params=ScanParams.from_settings()
         for row in cap:
             symbol=row["symbol"]
+            industry=_industry_for(source,row,warnings)
             stage={"symbol":symbol,"name":row["name"],"industry":row.get("industry"),
               "close":row["raw_close"],"total_market_cap_yi":float(row["total_market_cap"])/100_000_000,
               "limit_up_count":0,"limit_dates":[],"has_consecutive_limit_up":None,
@@ -77,6 +99,7 @@ def sync_market_day(trade_date: str, *, run_scan: bool=True, force: bool=False) 
               "passes_low":False,"passes_pullback":False,"passes_recent_return":False,
               "passes_final":False,"verification_status":"NOT_CHECKED","verification_message":None,
               "reject_reasons":[]}
+            stage["industry"]=industry
             try:
                 tx_raw=_history(source,symbol,trade_date,"tencent",False)
                 sina_raw=_history(source,symbol,trade_date,"sina",False)
@@ -137,6 +160,9 @@ def sync_market_day(trade_date: str, *, run_scan: bool=True, force: bool=False) 
                                 value=metrics["pullback_pct"]
                                 if value is None:
                                     reason="前次涨停后没有可计算的回撤区间"
+                                elif value < 0:
+                                    reason=(f"未发生回撤（最低价仍高于前次涨停收盘"
+                                            f"{(-value)*100:.1f}%）")
                                 else:
                                     reason=(f"前次涨停后回撤{value*100:.1f}%，要求"
                                             f"{settings.min_pullback_pct*100:.0f}%～{settings.max_pullback_pct*100:.0f}%")
@@ -159,14 +185,13 @@ def sync_market_day(trade_date: str, *, run_scan: bool=True, force: bool=False) 
         counts["low_rows"]=sum(r["passes_nonconsecutive"] and r["passes_low"] for r in stage_rows)
         counts["pullback_rows"]=sum(r["passes_nonconsecutive"] and r["passes_low"] and r["passes_pullback"] for r in stage_rows)
         counts["pattern_rows"]=counts["pullback_rows"]
-        counts["candidate_rows"]=save_stage_results(trade_date,stage_rows)
+        counts["candidate_rows"]=sum(1 for r in stage_rows if r.get("passes_final"))
         history_status="SUCCESS" if not any(UNKNOWN_LIMIT_RULE in w or INSUFFICIENT_HISTORY in w for w in warnings) else "WARNING"
         status="WARNING" if warnings or any(r["verification_status"]=="DATA_MISMATCH" for r in stage_rows) else "SUCCESS"
         message="；".join(warnings[:8]) if warnings else "理论涨停、腾讯历史重建、腾讯/新浪核验完成"
-        mark_pipeline_finish(trade_date,status,message,counts,audit["status"],history_status,current_time)
-        return counts["candidate_rows"]
+        return finish_scan_run(run_id,trade_date,status,message,counts,audit["status"],history_status,current_time,stage_rows)
     except Exception as exc:
-        mark_pipeline_finish(trade_date,"FAILED",f"{type(exc).__name__}: {exc}",counts,"FAILED",history_status,current_time)
+        fail_scan_run(run_id,trade_date,f"{type(exc).__name__}: {exc}",current_time)
         raise
 
 

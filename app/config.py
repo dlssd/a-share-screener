@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 
 def _bool(name: str, default: str) -> bool:
     return os.getenv(name, default).strip().lower() in {"1","true","yes","on"}
@@ -15,7 +17,9 @@ def _bool(name: str, default: str) -> bool:
 
 @dataclass(frozen=True)
 class Settings:
-    db_path: str = os.getenv("DB_PATH", "./data/screener.db")
+    # The default is independent of the caller's current working directory.
+    # An explicitly supplied DB_PATH remains an intentional override.
+    db_path: str = os.getenv("DB_PATH", str(PROJECT_ROOT / "data" / "screener.db"))
     app_username: str = os.getenv("APP_USERNAME", "").strip()
     app_password: str = os.getenv("APP_PASSWORD", "").strip()
     market_cap_min_yi: float = float(os.getenv("MARKET_CAP_MIN_YI", "80"))

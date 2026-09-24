@@ -95,13 +95,15 @@ def _historical_fallback(source: AKShareSource, trade_date: str, pool: pd.DataFr
 
 def build_market_audit(trade_date: str, *, force: bool=False) -> tuple[list[dict],dict]:
     init_db()
+    cached_universe=[]
+    cached_report=None
+    with connect() as conn:
+        cached_universe=[dict(r) for r in conn.execute("SELECT * FROM daily_limit_universe WHERE trade_date=?",(trade_date,))]
+        cached_report=conn.execute("SELECT * FROM market_audits WHERE trade_date=?",(trade_date,)).fetchone()
     if not force:
-        with connect() as conn:
-            saved=[dict(r) for r in conn.execute("SELECT * FROM daily_limit_universe WHERE trade_date=?",(trade_date,))]
-            audit=conn.execute("SELECT * FROM market_audits WHERE trade_date=?",(trade_date,)).fetchone()
-        if saved and audit:
-            report=dict(audit); report["only_theoretical"]=json.loads(report.pop("only_theoretical_json")); report["only_pool"]=json.loads(report.pop("only_pool_json"))
-            return saved,report
+        if cached_universe and cached_report:
+            report=dict(cached_report); report["only_theoretical"]=json.loads(report.pop("only_theoretical_json")); report["only_pool"]=json.loads(report.pop("only_pool_json"))
+            return cached_universe,report
     source=AKShareSource(); pool=source.limit_up_pool(trade_date); pool_symbols=set(pool["symbol"])
     now=datetime.now().astimezone()
     same_day=trade_date==now.strftime("%Y%m%d") and now.hour>=settings.publish_after_hour
@@ -121,7 +123,13 @@ def build_market_audit(trade_date: str, *, force: bool=False) -> tuple[list[dict
                     universe.append({**row,"industry":None,"market":market_for_symbol(symbol),"detection_status":"OK","source":"eastmoney_spot_theory"})
             market_rows=len(spot); status="SUCCESS"
         except Exception as exc:
-            universe,unknown,errors=_historical_fallback(source,trade_date,pool)
+            # A prior verified audit is a safe baseline when the large snapshot
+            # is unavailable. Refreshing the per-stock histories below still
+            # produces a new scan run, without re-requesting every STAR symbol.
+            if cached_universe:
+                universe=cached_universe; unknown=0; errors=[]
+            else:
+                universe,unknown,errors=_historical_fallback(source,trade_date,pool)
             try:
                 import akshare as ak
                 listing=ak.stock_info_a_code_name(); market_rows=len(listing)
@@ -130,7 +138,10 @@ def build_market_audit(trade_date: str, *, force: bool=False) -> tuple[list[dict
                 market_rows=0; st_excluded=0
             status="WARNING"; message=f"全市场收盘快照失败，降级为东方财富池+腾讯科创板逐股审计: {type(exc).__name__}; "+", ".join(errors[:5])
     else:
-        universe,unknown,errors=_historical_fallback(source,trade_date,pool)
+        if cached_universe:
+            universe=cached_universe; unknown=0; errors=[]
+        else:
+            universe,unknown,errors=_historical_fallback(source,trade_date,pool)
         try:
             import akshare as ak
             market_rows=len(ak.stock_info_a_code_name())
