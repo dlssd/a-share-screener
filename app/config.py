@@ -36,6 +36,7 @@ class Settings:
     include_star_market: bool = _bool("INCLUDE_STAR_MARKET", "true")
     include_chinext: bool = _bool("INCLUDE_CHINEXT", "true")
     include_bse: bool = _bool("INCLUDE_BSE", "true")
+    market_data_direct: bool = _bool("MARKET_DATA_DIRECT", "true")
     timezone: str = os.getenv("TZ", "Asia/Shanghai")
 
     @property

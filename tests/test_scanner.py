@@ -3,7 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 from app.config import settings
-from app.scanner import ScanParams, evaluate_candidate, has_consecutive_limit_ups, verify_independent_source
+from app.scanner import ScanParams, evaluate_candidate, evaluate_stages, has_consecutive_limit_ups, verify_independent_source
 
 
 def params():
@@ -54,3 +54,12 @@ def test_raw_price_cannot_be_used_for_adjusted_metrics():
     import pytest
     with pytest.raises(ValueError):
         evaluate_candidate(raw,["20250101","20250102"],params())
+
+
+def test_low_and_recent_return_are_independent_flags():
+    h=history()
+    h.loc[h.index[10],"adjusted_close"]=30.0
+    h.loc[h.index[-20],"adjusted_close"]=5.0
+    result=evaluate_stages(h,[h.trade_date.iloc[-8],h.trade_date.iloc[-1]],params())
+    assert result["passes_low"] is True
+    assert result["passes_recent_return"] is False

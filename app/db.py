@@ -44,6 +44,20 @@ CREATE TABLE IF NOT EXISTS scan_results (
  source TEXT NOT NULL, fetched_at TEXT NOT NULL, created_at TEXT NOT NULL,
  PRIMARY KEY(trade_date,symbol));
 CREATE INDEX IF NOT EXISTS idx_scan_results_date ON scan_results(trade_date);
+CREATE TABLE IF NOT EXISTS scan_stage_results (
+ trade_date TEXT NOT NULL, symbol TEXT NOT NULL, name TEXT NOT NULL, industry TEXT,
+ close REAL NOT NULL, total_market_cap_yi REAL NOT NULL,
+ limit_up_count INTEGER NOT NULL DEFAULT 0, limit_dates_json TEXT NOT NULL DEFAULT '[]',
+ has_consecutive_limit_up INTEGER,
+ low_position_pct REAL, distance_from_low_pct REAL, pullback_pct REAL, recent_return_pct REAL,
+ passes_market_cap INTEGER NOT NULL DEFAULT 1, passes_repeat_limit INTEGER NOT NULL DEFAULT 0,
+ passes_nonconsecutive INTEGER NOT NULL DEFAULT 0, passes_low INTEGER NOT NULL DEFAULT 0,
+ passes_pullback INTEGER NOT NULL DEFAULT 0, passes_recent_return INTEGER NOT NULL DEFAULT 0,
+ passes_final INTEGER NOT NULL DEFAULT 0, verification_status TEXT NOT NULL,
+ verification_message TEXT, reject_reasons_json TEXT NOT NULL DEFAULT '[]',
+ source TEXT NOT NULL, fetched_at TEXT NOT NULL,
+ PRIMARY KEY(trade_date,symbol));
+CREATE INDEX IF NOT EXISTS idx_stage_results_date ON scan_stage_results(trade_date);
 CREATE TABLE IF NOT EXISTS market_audits (
  trade_date TEXT PRIMARY KEY, status TEXT NOT NULL, market_rows INTEGER NOT NULL,
  theoretical_rows INTEGER NOT NULL, pool_rows INTEGER NOT NULL, common_rows INTEGER NOT NULL,
@@ -167,6 +181,20 @@ def latest_successful_run():
         return conn.execute("SELECT * FROM pipeline_runs WHERE status IN ('SUCCESS','WARNING') ORDER BY trade_date DESC LIMIT 1").fetchone()
 
 
+def run_for_date(trade_date: str):
+    init_db()
+    with connect() as conn:
+        return conn.execute("SELECT * FROM pipeline_runs WHERE trade_date=?", (trade_date,)).fetchone()
+
+
+def scanned_dates() -> list[str]:
+    init_db()
+    with connect() as conn:
+        return [row[0] for row in conn.execute(
+            "SELECT trade_date FROM pipeline_runs WHERE status IN ('SUCCESS','WARNING','FAILED') ORDER BY trade_date"
+        )]
+
+
 def save_scan_results(trade_date: str, rows: list[Mapping]) -> int:
     now = utcnow()
     with transaction() as conn:
@@ -177,3 +205,52 @@ def save_scan_results(trade_date: str, rows: list[Mapping]) -> int:
                     r["verification_status"],r.get("verification_message"),"eastmoney_pool+tencent+sina",now,now) for r in rows]
         conn.executemany("""INSERT INTO scan_results VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", payload)
         return len(payload)
+
+
+def save_stage_results(trade_date: str, rows: list[Mapping]) -> int:
+    """Atomically replace one day's complete stage audit and official candidates."""
+    now = utcnow()
+    columns = [
+        "trade_date","symbol","name","industry","close","total_market_cap_yi",
+        "limit_up_count","limit_dates_json","has_consecutive_limit_up",
+        "low_position_pct","distance_from_low_pct","pullback_pct","recent_return_pct",
+        "passes_market_cap","passes_repeat_limit","passes_nonconsecutive","passes_low",
+        "passes_pullback","passes_recent_return","passes_final","verification_status",
+        "verification_message","reject_reasons_json","source","fetched_at",
+    ]
+    values = []
+    for row in rows:
+        values.append((
+            trade_date,row["symbol"],row["name"],row.get("industry"),row["close"],
+            row["total_market_cap_yi"],row.get("limit_up_count",0),
+            json.dumps(row.get("limit_dates",[]),ensure_ascii=False),
+            _sqlite_bool(row.get("has_consecutive_limit_up")),row.get("low_position_pct"),
+            row.get("distance_from_low_pct"),row.get("pullback_pct"),row.get("recent_return_pct"),
+            _sqlite_bool(row.get("passes_market_cap",True)),_sqlite_bool(row.get("passes_repeat_limit",False)),
+            _sqlite_bool(row.get("passes_nonconsecutive",False)),_sqlite_bool(row.get("passes_low",False)),
+            _sqlite_bool(row.get("passes_pullback",False)),_sqlite_bool(row.get("passes_recent_return",False)),
+            _sqlite_bool(row.get("passes_final",False)),row.get("verification_status","NOT_CHECKED"),
+            row.get("verification_message"),json.dumps(row.get("reject_reasons",[]),ensure_ascii=False),
+            "eastmoney+tencent+sina",now,
+        ))
+    with transaction() as conn:
+        conn.execute("DELETE FROM scan_stage_results WHERE trade_date=?",(trade_date,))
+        conn.execute("DELETE FROM scan_results WHERE trade_date=?",(trade_date,))
+        if values:
+            placeholders=",".join("?" for _ in columns)
+            conn.executemany(f"INSERT INTO scan_stage_results ({','.join(columns)}) VALUES ({placeholders})",values)
+        final_rows=[row for row in rows if row.get("passes_final")]
+        payload=[(trade_date,r["symbol"],r["name"],r.get("industry"),r["close"],r["total_market_cap_yi"],
+                  r["limit_up_count"],json.dumps(r["limit_dates"],ensure_ascii=False),r["low_position_pct"],
+                  r["distance_from_low_pct"],r.get("pullback_pct"),r.get("recent_return_pct"),
+                  r["verification_status"],r.get("verification_message"),"eastmoney+tencent+sina",now,now)
+                 for r in final_rows]
+        if payload:
+            conn.executemany("INSERT INTO scan_results VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",payload)
+    return len(final_rows)
+
+
+def _sqlite_bool(value):
+    if value is None:
+        return None
+    return 1 if value else 0

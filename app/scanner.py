@@ -51,7 +51,8 @@ def evaluate_stages(history: pd.DataFrame, limit_dates: list[str], params: ScanP
     recent = h.tail(params.recent_trading_days)
     first = float(recent["adjusted_close"].iloc[0])
     recent_return = current/first-1 if first > 0 else None
-    passes_low = low_position <= params.max_low_position and recent_return is not None and recent_return <= params.max_recent_return_pct
+    passes_low = low_position <= params.max_low_position
+    passes_recent_return = recent_return is not None and recent_return <= params.max_recent_return_pct
     today = str(h["trade_date"].iloc[-1])
     previous = [d for d in sorted(limit_dates) if d < today]
     pullback = None
@@ -65,12 +66,13 @@ def evaluate_stages(history: pd.DataFrame, limit_dates: list[str], params: ScanP
     passes_pullback = pullback is not None and params.min_pullback_pct <= pullback <= params.max_pullback_pct
     return {"low_position_pct":low_position,"distance_from_low_pct":distance,
             "pullback_pct":pullback,"recent_return_pct":recent_return,
-            "passes_low":passes_low,"passes_pullback":passes_pullback}
+            "passes_low":passes_low,"passes_pullback":passes_pullback,
+            "passes_recent_return":passes_recent_return}
 
 
 def evaluate_candidate(history: pd.DataFrame, limit_dates: list[str], params: ScanParams) -> dict | None:
     metrics = evaluate_stages(history, limit_dates, params)
-    if not metrics or not metrics["passes_low"] or not metrics["passes_pullback"]:
+    if not metrics or not metrics["passes_low"] or not metrics["passes_pullback"] or not metrics["passes_recent_return"]:
         return None
     return {k:v for k,v in metrics.items() if not k.startswith("passes_")}
 

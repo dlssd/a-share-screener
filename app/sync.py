@@ -8,7 +8,7 @@ import pandas as pd
 from .audit import build_market_audit
 from .config import settings
 from .datasource import AKShareSource
-from .db import connect, init_db, mark_pipeline_finish, mark_pipeline_start, pipeline_success, save_scan_results
+from .db import connect, init_db, mark_pipeline_finish, mark_pipeline_start, pipeline_success, save_stage_results
 from .limit_rules import INSUFFICIENT_HISTORY, UNKNOWN_LIMIT_RULE, detect_limit_up_days
 from .scanner import ScanParams, evaluate_stages, has_consecutive_limit_ups, verify_independent_source
 
@@ -66,49 +66,102 @@ def sync_market_day(trade_date: str, *, run_scan: bool=True, force: bool=False) 
         cap=[r for r in universe if r.get("total_market_cap") is not None and float(r["total_market_cap"])>=settings.market_cap_min_cny]
         counts["cap_rows"]=len(cap); recent_calendar=source.trading_days(
             (datetime.strptime(trade_date,"%Y%m%d")-timedelta(days=60)).strftime("%Y%m%d"),trade_date)[-settings.recent_trading_days:]
-        prepared=[]
+        stage_rows=[]
+        params=ScanParams.from_settings()
         for row in cap:
             symbol=row["symbol"]
-            tx_raw=_history(source,symbol,trade_date,"tencent",False)
-            sina_raw=_history(source,symbol,trade_date,"sina",False)
-            if len(tx_raw)<settings.low_window_days or len(sina_raw)<settings.low_window_days:
-                warnings.append(f"{symbol} {INSUFFICIENT_HISTORY}"); continue
-            tx_detection=detect_limit_up_days(tx_raw,symbol,row["name"])
-            sina_detection=detect_limit_up_days(sina_raw,symbol,row["name"])
-            if tx_detection.status==UNKNOWN_LIMIT_RULE or sina_detection.status==UNKNOWN_LIMIT_RULE:
-                warnings.append(f"{symbol} {UNKNOWN_LIMIT_RULE}"); continue
-            tx_dates=[d for d in tx_detection.dates if d in recent_calendar]
-            sina_dates=[d for d in sina_detection.dates if d in recent_calendar]
-            verification="VERIFIED" if tx_dates==sina_dates else "DATA_MISMATCH"
-            if verification=="DATA_MISMATCH": warnings.append(f"{symbol} 历史涨停日期双源不一致")
-            if len(tx_dates)>=settings.min_limit_ups:
-                prepared.append((row,tx_dates,verification,tx_raw,sina_raw))
-        counts["repeated_rows"]=len(prepared)
-        prepared=[x for x in prepared if not has_consecutive_limit_ups(x[1],recent_calendar)]
-        counts["nonconsecutive_rows"]=len(prepared); results=[]
-        if run_scan:
-            params=ScanParams.from_settings()
-            for row,limit_dates,verification,tx_raw,sina_raw in prepared:
-                adjusted=_history(source,row["symbol"],trade_date,"tencent",True)
-                if len(adjusted)<settings.low_window_days:
-                    warnings.append(f"{row['symbol']} {INSUFFICIENT_HISTORY}"); continue
-                metrics=evaluate_stages(adjusted,limit_dates,params)
-                if not metrics or not metrics["passes_low"]: continue
-                counts["low_rows"]+=1
-                if not metrics["passes_pullback"]: continue
-                counts["pullback_rows"]+=1; counts["pattern_rows"]+=1
+            stage={"symbol":symbol,"name":row["name"],"industry":row.get("industry"),
+              "close":row["raw_close"],"total_market_cap_yi":float(row["total_market_cap"])/100_000_000,
+              "limit_up_count":0,"limit_dates":[],"has_consecutive_limit_up":None,
+              "passes_market_cap":True,"passes_repeat_limit":False,"passes_nonconsecutive":False,
+              "passes_low":False,"passes_pullback":False,"passes_recent_return":False,
+              "passes_final":False,"verification_status":"NOT_CHECKED","verification_message":None,
+              "reject_reasons":[]}
+            try:
+                tx_raw=_history(source,symbol,trade_date,"tencent",False)
+                sina_raw=_history(source,symbol,trade_date,"sina",False)
+                tx_detection=detect_limit_up_days(tx_raw,symbol,row["name"])
+                sina_detection=detect_limit_up_days(sina_raw,symbol,row["name"])
+                if tx_detection.status==UNKNOWN_LIMIT_RULE or sina_detection.status==UNKNOWN_LIMIT_RULE:
+                    stage["verification_status"]=UNKNOWN_LIMIT_RULE
+                    stage["reject_reasons"].append("涨停规则暂无法可靠确认")
+                    warnings.append(f"{symbol} {UNKNOWN_LIMIT_RULE}")
+                    stage_rows.append(stage); continue
+                tx_dates=[d for d in tx_detection.dates if d in recent_calendar]
+                sina_dates=[d for d in sina_detection.dates if d in recent_calendar]
+                stage["limit_dates"]=tx_dates; stage["limit_up_count"]=len(tx_dates)
+                # A newly listed stock with fewer than 20 observations cannot
+                # provide a complete 20-trading-day window, even if it has
+                # already hit the limit twice. Keep it visible but fail closed.
+                complete_recent_window=(len(tx_raw)>=settings.recent_trading_days and
+                                        len(sina_raw)>=settings.recent_trading_days)
+                stage["passes_repeat_limit"]=(complete_recent_window and
+                                               len(tx_dates)>=settings.min_limit_ups)
+                consecutive=has_consecutive_limit_ups(tx_dates,recent_calendar)
+                stage["has_consecutive_limit_up"]=consecutive
+                stage["passes_nonconsecutive"]=stage["passes_repeat_limit"] and not consecutive
                 pool_row={"trade_date":trade_date,"close":row["raw_close"],"pct_chg":None}
                 tx_status,tx_msg=verify_independent_source(pool_row,tx_raw,"腾讯")
                 si_status,si_msg=verify_independent_source(pool_row,sina_raw,"新浪")
-                if tx_status!="VERIFIED" or si_status!="VERIFIED": verification="DATA_MISMATCH"
-                clean={k:v for k,v in metrics.items() if not k.startswith("passes_")}
-                results.append({"symbol":row["symbol"],"name":row["name"],"industry":row.get("industry"),
-                  "close":row["raw_close"],"total_market_cap_yi":float(row["total_market_cap"])/100_000_000,
-                  "limit_up_count":len(limit_dates),"limit_dates":limit_dates,**clean,
-                  "verification_status":verification,"verification_message":tx_msg+"；"+si_msg})
-            counts["candidate_rows"]=save_scan_results(trade_date,results)
+                dates_match=tx_dates==sina_dates
+                verified=tx_status=="VERIFIED" and si_status=="VERIFIED" and dates_match
+                stage["verification_status"]="VERIFIED" if verified else "DATA_MISMATCH"
+                stage["verification_message"]=tx_msg+"；"+si_msg
+                if not dates_match:
+                    stage["verification_message"] += "；腾讯/新浪历史涨停日期不一致"
+                if not verified: warnings.append(f"{symbol} 历史行情双源不一致")
+                if not complete_recent_window:
+                    stage["reject_reasons"].append("上市时间较短，无法形成完整20交易日统计")
+                elif not stage["passes_repeat_limit"]:
+                    stage["reject_reasons"].append(
+                        f"最近20日涨停{len(tx_dates)}次，要求至少{settings.min_limit_ups}次")
+                elif consecutive:
+                    stage["reject_reasons"].append("最近20日存在连续交易日涨停")
+
+                if run_scan:
+                    adjusted=_history(source,symbol,trade_date,"tencent",True)
+                    metrics=evaluate_stages(adjusted,tx_dates,params)
+                    if metrics is None:
+                        stage["verification_status"]=INSUFFICIENT_HISTORY
+                        stage["reject_reasons"].append("上市时间较短，历史不足250日")
+                        warnings.append(f"{symbol} {INSUFFICIENT_HISTORY}")
+                    else:
+                        for key in ("low_position_pct","distance_from_low_pct","pullback_pct","recent_return_pct",
+                                    "passes_low","passes_pullback","passes_recent_return"):
+                            stage[key]=metrics[key]
+                        if stage["passes_repeat_limit"] and stage["passes_nonconsecutive"]:
+                            if not stage["passes_low"]:
+                                stage["reject_reasons"].append(
+                                    f"250日位置{metrics['low_position_pct']*100:.1f}%，要求≤{settings.max_low_position*100:.0f}%")
+                            if not stage["passes_pullback"]:
+                                value=metrics["pullback_pct"]
+                                if value is None:
+                                    reason="前次涨停后没有可计算的回撤区间"
+                                else:
+                                    reason=(f"前次涨停后回撤{value*100:.1f}%，要求"
+                                            f"{settings.min_pullback_pct*100:.0f}%～{settings.max_pullback_pct*100:.0f}%")
+                                stage["reject_reasons"].append(reason)
+                            if not stage["passes_recent_return"]:
+                                stage["reject_reasons"].append(
+                                    f"最近20日涨幅{metrics['recent_return_pct']*100:.1f}%，要求≤{settings.max_recent_return_pct*100:.0f}%")
+                        stage["passes_final"]=all((stage["passes_market_cap"],stage["passes_repeat_limit"],
+                            stage["passes_nonconsecutive"],stage["passes_low"],stage["passes_pullback"],
+                            stage["passes_recent_return"]))
+            except Exception as exc:
+                stage["verification_status"]="DATA_UNAVAILABLE"
+                stage["verification_message"]=f"{type(exc).__name__}: {exc}"
+                stage["reject_reasons"].append("历史行情暂时无法完整获取")
+                warnings.append(f"{symbol} {type(exc).__name__}")
+            stage_rows.append(stage)
+
+        counts["repeated_rows"]=sum(r["passes_repeat_limit"] for r in stage_rows)
+        counts["nonconsecutive_rows"]=sum(r["passes_nonconsecutive"] for r in stage_rows)
+        counts["low_rows"]=sum(r["passes_nonconsecutive"] and r["passes_low"] for r in stage_rows)
+        counts["pullback_rows"]=sum(r["passes_nonconsecutive"] and r["passes_low"] and r["passes_pullback"] for r in stage_rows)
+        counts["pattern_rows"]=counts["pullback_rows"]
+        counts["candidate_rows"]=save_stage_results(trade_date,stage_rows)
         history_status="SUCCESS" if not any(UNKNOWN_LIMIT_RULE in w or INSUFFICIENT_HISTORY in w for w in warnings) else "WARNING"
-        status="WARNING" if warnings or any(r["verification_status"]=="DATA_MISMATCH" for r in results) else "SUCCESS"
+        status="WARNING" if warnings or any(r["verification_status"]=="DATA_MISMATCH" for r in stage_rows) else "SUCCESS"
         message="；".join(warnings[:8]) if warnings else "理论涨停、腾讯历史重建、腾讯/新浪核验完成"
         mark_pipeline_finish(trade_date,status,message,counts,audit["status"],history_status,current_time)
         return counts["candidate_rows"]

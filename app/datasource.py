@@ -43,7 +43,9 @@ def _retry(label: str, fn: Callable):
             last = exc
             if attempt + 1 < settings.request_retries:
                 time.sleep(2**attempt)
-    raise DataSourceError(f"{label} failed after {settings.request_retries} attempts: {last}") from last
+    domestic=("AKShare","Eastmoney","STAR","individual","Sina","Tencent")
+    detail=_network_hint(last) if settings.market_data_direct and label.startswith(domestic) else str(last)
+    raise DataSourceError(f"{label} failed after {settings.request_retries} attempts: {detail}") from last
 
 
 def _timed(fn: Callable):
@@ -53,11 +55,17 @@ def _timed(fn: Callable):
 
 @contextmanager
 def _requests_timeout(seconds: float):
-    """AKShare does not expose timeout; add one to every requests call it makes."""
+    """Give AKShare calls a timeout and optionally ignore proxy environment variables.
+
+    This patch is scoped to the datasource call. It does not alter the process
+    environment or the user's system/VPN configuration.
+    """
     import requests
     original = requests.sessions.Session.request
 
     def request(session, method, url, **kwargs):
+        if settings.market_data_direct:
+            session.trust_env = False
         kwargs.setdefault("timeout", seconds)
         return original(session, method, url, **kwargs)
 
@@ -66,6 +74,22 @@ def _requests_timeout(seconds: float):
         yield
     finally:
         requests.sessions.Session.request = original
+
+
+def _market_session():
+    """Independent domestic-market session; direct mode does not inherit HTTP(S)_PROXY."""
+    import requests
+    session = requests.Session()
+    session.trust_env = not settings.market_data_direct
+    return session
+
+
+def _network_hint(exc: Exception) -> str:
+    text = str(exc)
+    if settings.market_data_direct and "系统/TUN代理" not in text:
+        text += ("；当前网络可能通过系统/TUN代理，建议将 eastmoney.com / gtimg.cn / "
+                 "sina.com.cn 设置为直连。")
+    return text
 
 
 class AKShareSource:
@@ -98,19 +122,19 @@ class AKShareSource:
     def full_market_spot(self) -> pd.DataFrame:
         """沪深京全市场当前快照；调用者必须确认当前日已经完整收盘。"""
         def fetch():
-            import requests
             params={"pn":"1","pz":"10000","po":"1","np":"1",
                     "ut":"bd1d9ddb04089700cf9c27f6f7426281","fltt":"2","invt":"2","fid":"f12",
                     "fs":"m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048",
                     "fields":"f2,f3,f4,f5,f6,f12,f13,f14,f15,f16,f17,f18,f20,f21"}
             last=None
-            for host in ("push2.eastmoney.com","20.push2.eastmoney.com","82.push2.eastmoney.com"):
-                try:
-                    response=requests.get(f"https://{host}/api/qt/clist/get",params=params,timeout=settings.request_timeout)
-                    response.raise_for_status(); data=response.json().get("data")
-                    if data and data.get("diff"): return pd.DataFrame(data["diff"])
-                except Exception as exc: last=exc
-            raise DataSourceError(f"full market spot failed: {last}")
+            with _market_session() as session:
+                for host in ("push2.eastmoney.com","20.push2.eastmoney.com","82.push2.eastmoney.com"):
+                    try:
+                        response=session.get(f"https://{host}/api/qt/clist/get",params=params,timeout=settings.request_timeout)
+                        response.raise_for_status(); data=response.json().get("data")
+                        if data and data.get("diff"): return pd.DataFrame(data["diff"])
+                    except Exception as exc: last=exc
+            raise DataSourceError(f"full market spot failed: {_network_hint(last)}")
         raw=_retry("Eastmoney full market spot",fetch)
         mapping={"f12":"symbol","f14":"name","f2":"raw_close","f18":"previous_close",
                  "f3":"pct_chg","f20":"total_market_cap","f21":"float_market_cap",
@@ -153,9 +177,10 @@ class AKShareSource:
     def tencent_history(self, symbol: str, start_date: str, end_date: str, *, adjusted: bool) -> pd.DataFrame:
         def fetch():
             import akshare as ak
-            return ak.stock_zh_a_hist_tx(
-                symbol=self.market_symbol(symbol), start_date=start_date, end_date=end_date,
-                adjust="qfq" if adjusted else "", timeout=settings.request_timeout)
+            with _requests_timeout(settings.request_timeout):
+                return ak.stock_zh_a_hist_tx(
+                    symbol=self.market_symbol(symbol), start_date=start_date, end_date=end_date,
+                    adjust="qfq" if adjusted else "", timeout=settings.request_timeout)
         raw = _retry(f"Tencent history {symbol}", fetch)
         return self._normalize_history(raw, symbol, "tencent", adjusted)
 
