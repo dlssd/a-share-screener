@@ -22,11 +22,26 @@ from .db import (active_run_for_date, connect, get_news_cache, init_db, publishe
 from .datasource import AKShareSource
 from .sync import DataValidationError, sync_market_day
 
-app = FastAPI(title="A股低位多涨停筛选器", version="0.7.0")
+app = FastAPI(title="A股低位多涨停筛选器", version="0.7.1")
 app.mount("/static",StaticFiles(directory=str(Path(__file__).parent / "static")),name="static")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 security = HTTPBasic(auto_error=False)
 refresh_lock = threading.Lock()
+WARNING_LABELS={
+    "HISTORICAL_REBUILD":"历史重建结果，可能受免费数据源历史覆盖限制",
+    "CURRENT_SOURCE_DEGRADED":"当前主数据源异常，已使用降级核验路径",
+    "PARTIAL_VERIFICATION":"部分股票或字段未能完成双源核验",
+}
+
+
+def _warning_type(selected) -> str | None:
+    if not selected or selected["status"]!="WARNING": return None
+    value=selected["warning_type"] if "warning_type" in selected.keys() else None
+    if value: return value
+    message=str(selected["message"] or "")
+    if "历史日期" in message or "历史重建" in message: return "HISTORICAL_REBUILD"
+    if "全市场收盘快照失败" in message: return "CURRENT_SOURCE_DEGRADED"
+    return "PARTIAL_VERIFICATION"
 
 
 def auth(credentials: Optional[HTTPBasicCredentials] = Depends(security)) -> None:
@@ -128,6 +143,8 @@ def index(request: Request, date: Optional[str] = None):
     repeated=sorted((r for r in stages if r["passes_repeat_limit"]),key=lambda r:(r["has_consecutive_limit_up"],-r["limit_up_count"],r["symbol"]))
     market_rows=market_rows_for_run(int(selected["run_id"])) if selected else []
     environment=market_environment_for_run(int(selected["run_id"])) if selected else None
+    warning_type=_warning_type(selected); warning_label=WARNING_LABELS.get(warning_type)
+    market_complete=bool(selected and selected["status"]=="SUCCESS" and selected["akshare_status"]=="SUCCESS")
     board_stats={"first":sum(r["consecutive_boards"]<=1 for r in market_rows),
                  "two":sum(r["consecutive_boards"]==2 for r in market_rows),
                  "three":sum(r["consecutive_boards"]==3 for r in market_rows),
@@ -145,6 +162,7 @@ def index(request: Request, date: Optional[str] = None):
             "request": request,
             "official":official,"watch":watch,"repeated":repeated,"cap_rows":stages,
             "market_rows":market_rows,"board_stats":board_stats,"industries":industries,"environment":environment,
+            "warning_type":warning_type,"warning_label":warning_label,"market_complete":market_complete,
             "chosen_date": chosen,
             "selected":dict(selected) if selected else None,
             "active":dict(active) if active else None,

@@ -273,8 +273,10 @@ def sync_market_day(trade_date: str, *, run_scan: bool=True, force: bool=False) 
         history_status="SUCCESS" if not any(UNKNOWN_LIMIT_RULE in w or INSUFFICIENT_HISTORY in w for w in warnings) else "WARNING"
         status="WARNING" if warnings or any(r["verification_status"]=="DATA_MISMATCH" for r in stage_rows) else "SUCCESS"
         message="；".join(warnings[:8]) if warnings else "理论涨停、腾讯历史重建、腾讯/新浪核验完成"
+        warning_type=audit.get("warning_type")
+        if status=="WARNING" and warning_type is None: warning_type="PARTIAL_VERIFICATION"
         return finish_scan_run(run_id,trade_date,status,message,counts,audit["status"],history_status,current_time,stage_rows,
-                               market_rows,market_environment)
+                               market_rows,market_environment,warning_type)
     except Exception as exc:
         fail_scan_run(run_id,trade_date,f"{type(exc).__name__}: {exc}",current_time)
         raise
@@ -285,7 +287,12 @@ def sync_latest_if_needed(force: bool=False) -> str:
 
 
 def backfill(trading_days: int=25, *, force: bool=False) -> list[str]:
-    day=sync_latest_if_needed(force=force); return [day]
+    if trading_days<=0: return []
+    latest=resolve_latest_completed_trade_date()
+    start=(datetime.strptime(latest,"%Y%m%d")-timedelta(days=max(45,trading_days*3))).strftime("%Y%m%d")
+    days=trade_dates_between(start,latest)[-trading_days:]
+    for day in days: sync_market_day(day,force=force)
+    return days
 
 
 def backfill_range(start_date: str, end_date: str, *, force: bool=False) -> list[str]:

@@ -8,7 +8,8 @@ import pandas as pd
 
 from .config import settings
 from .datasource import AKShareSource
-from .db import connect, init_db, transaction, upsert_dataframe, utcnow
+from .db import (connect, get_industry_cache, init_db, save_industry_cache,
+                 transaction, upsert_dataframe, utcnow)
 from .limit_rules import detect_limit_up_days, market_for_symbol, theoretical_limit_price, limit_rate
 
 
@@ -27,12 +28,36 @@ def _save(trade_date: str, universe: list[dict], report: dict) -> None:
         with transaction() as conn:
             upsert_dataframe(conn,"daily_limit_universe",frame,cols,["trade_date","symbol"])
     with connect() as conn:
-        conn.execute("""INSERT OR REPLACE INTO market_audits VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        conn.execute("""INSERT OR REPLACE INTO market_audits
+          (trade_date,status,market_rows,theoretical_rows,pool_rows,common_rows,only_theoretical_json,only_pool_json,
+           main_rows,chinext_rows,star_rows,bse_rows,st_excluded_rows,unknown_rows,message,fetched_at,warning_type)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
           (trade_date,report["status"],report["market_rows"],report["theoretical_rows"],report["pool_rows"],
            report["common_rows"],json.dumps(report["only_theoretical"],ensure_ascii=False),
            json.dumps(report["only_pool"],ensure_ascii=False),report["main_rows"],report["chinext_rows"],
            report["star_rows"],report["bse_rows"],report["st_excluded_rows"],report["unknown_rows"],
-           report["message"],utcnow())); conn.commit()
+           report["message"],utcnow(),report.get("warning_type"))); conn.commit()
+
+
+def _enrich_industries(source: AKShareSource, universe: list[dict], pool: pd.DataFrame) -> None:
+    """Pool industry wins, then persistent cache, then best-effort detail lookup."""
+    pool_industry={str(r["symbol"]):r.get("industry") for r in pool.to_dict("records")}
+    def clean(value):
+        if value is None or pd.isna(value): return None
+        text=str(value).strip()
+        return text if text and text.lower() not in {"nan","none","-"} else None
+    for row in universe:
+        symbol=str(row["symbol"]); value=clean(pool_industry.get(symbol)) or clean(row.get("industry"))
+        if not value:
+            cached=get_industry_cache(symbol); value=clean(cached["industry"]) if cached else None
+        if not value:
+            try:
+                info=source.individual_info(symbol); value=info.get("行业") or info.get("所属行业")
+                value=str(value).strip() if value else None
+                save_industry_cache(symbol,str(row.get("name","")),value,"akshare_individual_info")
+            except Exception:
+                value=None
+        row["industry"]=value
 
 
 def _spot_universe(source: AKShareSource) -> tuple[list[dict],int,int]:
@@ -107,7 +132,7 @@ def build_market_audit(trade_date: str, *, force: bool=False) -> tuple[list[dict
     source=AKShareSource(); pool=source.limit_up_pool(trade_date); pool_symbols=set(pool["symbol"])
     now=datetime.now().astimezone()
     same_day=trade_date==now.strftime("%Y%m%d") and now.hour>=settings.publish_after_hour
-    message=""
+    message=""; warning_type=None
     if same_day:
         try:
             spot=source.full_market_spot()
@@ -136,7 +161,7 @@ def build_market_audit(trade_date: str, *, force: bool=False) -> tuple[list[dict
                 st_excluded=int(listing["name"].astype(str).str.contains("ST",case=False).sum())
             except Exception:
                 market_rows=0; st_excluded=0
-            status="WARNING"; message=f"全市场收盘快照失败，降级为东方财富池+腾讯科创板逐股审计: {type(exc).__name__}; "+", ".join(errors[:5])
+            status="WARNING"; warning_type="CURRENT_SOURCE_DEGRADED"; message=f"全市场收盘快照失败，降级为东方财富池+腾讯科创板逐股审计: {type(exc).__name__}; "+", ".join(errors[:5])
     else:
         if cached_universe:
             universe=cached_universe; unknown=0; errors=[]
@@ -148,15 +173,18 @@ def build_market_audit(trade_date: str, *, force: bool=False) -> tuple[list[dict
             st_excluded=int(ak.stock_info_a_code_name()["name"].astype(str).str.contains("ST",case=False).sum())
         except Exception:
             market_rows=0; st_excluded=0
-        status="WARNING"; message="历史日期无可回放的全市场快照：东方财富池作基线，腾讯逐股独立检查科创板；"+", ".join(errors[:5])
+        status="WARNING"; warning_type="HISTORICAL_REBUILD"; message="历史日期无可回放的全市场快照：东方财富池作基线，腾讯逐股独立检查科创板；"+", ".join(errors[:5])
     # A current AKShare/东方财富 response may already contain STAR stocks even
     # though older endpoint notes said otherwise; merge by symbol before stats.
     universe=list({r["symbol"]:r for r in universe}.values())
+    _enrich_industries(source,universe,pool)
     theoretical={r["symbol"] for r in universe if r["detection_status"]=="OK"}
     common=theoretical & pool_symbols; only_theory=sorted(theoretical-pool_symbols); only_pool=sorted(pool_symbols-theoretical)
     board_counts={m:sum(1 for r in universe if r["market"]==m and r["detection_status"]=="OK")
                   for m in ("MAIN","CHINEXT","STAR","BSE")}
-    report={"status":"WARNING" if unknown or status=="WARNING" or only_pool else "SUCCESS","market_rows":market_rows,
+    final_status="WARNING" if unknown or status=="WARNING" or only_pool else "SUCCESS"
+    if final_status=="WARNING" and warning_type is None: warning_type="PARTIAL_VERIFICATION"
+    report={"status":final_status,"warning_type":warning_type,"market_rows":market_rows,
       "theoretical_rows":len(theoretical),"pool_rows":len(pool),"common_rows":len(common),
       "only_theoretical":only_theory,"only_pool":only_pool,"main_rows":board_counts["MAIN"],
       "chinext_rows":board_counts["CHINEXT"],"star_rows":board_counts["STAR"],"bse_rows":board_counts["BSE"],

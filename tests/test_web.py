@@ -134,3 +134,28 @@ def test_closed_date_has_no_run_button(tmp_path, monkeypatch):
         assert "生成 09-26 复盘" not in page.text
     finally:
         object.__setattr__(settings,"db_path",original)
+
+
+def test_historical_warning_never_claims_complete_market(tmp_path, monkeypatch):
+    original=settings.db_path; object.__setattr__(settings,"db_path",str(tmp_path/"confidence.db"))
+    try:
+        db.init_db(); run=db.start_scan_run("20260921","now")
+        db.finish_scan_run(run,"20260921","WARNING","历史日期无可回放的全市场快照",{},
+                           "WARNING","SUCCESS","now",[],warning_type="HISTORICAL_REBUILD")
+        monkeypatch.setattr(web_module,"is_trade_date",lambda date:True)
+        monkeypatch.setattr(web_module,"previous_trade_date",lambda date:None)
+        monkeypatch.setattr(web_module,"next_trade_date",lambda date:None)
+        monkeypatch.setattr(web_module,"month_days",lambda month:[{"date":"20260921","is_trade":True}])
+        page=TestClient(app).get("/?date=20260921")
+        assert page.status_code==200
+        assert "已识别涨停" in page.text
+        assert "历史重建结果，可能受免费数据源历史覆盖限制" in page.text
+        assert "全市场涨停 / 完整" not in page.text
+    finally:
+        object.__setattr__(settings,"db_path",original)
+
+
+def test_warning_type_friendly_labels():
+    assert web_module.WARNING_LABELS["HISTORICAL_REBUILD"].startswith("历史重建结果")
+    assert "主数据源异常" in web_module.WARNING_LABELS["CURRENT_SOURCE_DEGRADED"]
+    assert "双源核验" in web_module.WARNING_LABELS["PARTIAL_VERIFICATION"]

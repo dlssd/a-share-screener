@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS scan_runs (
  akshare_status TEXT, history_status TEXT, current_time TEXT,
  pool_rows INTEGER DEFAULT 0, cap_rows INTEGER DEFAULT 0, repeated_rows INTEGER DEFAULT 0,
  nonconsecutive_rows INTEGER DEFAULT 0, low_rows INTEGER DEFAULT 0, pullback_rows INTEGER DEFAULT 0,
- pattern_rows INTEGER DEFAULT 0, candidate_rows INTEGER DEFAULT 0);
+ pattern_rows INTEGER DEFAULT 0, candidate_rows INTEGER DEFAULT 0, warning_type TEXT);
 CREATE INDEX IF NOT EXISTS idx_scan_runs_date ON scan_runs(trade_date,run_id);
 CREATE TABLE IF NOT EXISTS published_snapshots (
  trade_date TEXT PRIMARY KEY, run_id INTEGER NOT NULL, published_at TEXT NOT NULL);
@@ -91,7 +91,7 @@ CREATE TABLE IF NOT EXISTS market_audits (
  only_theoretical_json TEXT NOT NULL, only_pool_json TEXT NOT NULL,
  main_rows INTEGER NOT NULL, chinext_rows INTEGER NOT NULL, star_rows INTEGER NOT NULL,
  bse_rows INTEGER NOT NULL, st_excluded_rows INTEGER NOT NULL, unknown_rows INTEGER NOT NULL,
- message TEXT, fetched_at TEXT NOT NULL);
+ message TEXT, fetched_at TEXT NOT NULL, warning_type TEXT);
 CREATE TABLE IF NOT EXISTS daily_limit_universe (
  trade_date TEXT NOT NULL, symbol TEXT NOT NULL, name TEXT NOT NULL, raw_close REAL NOT NULL,
  previous_close REAL, total_market_cap REAL, industry TEXT, market TEXT NOT NULL,
@@ -145,6 +145,10 @@ def init_db() -> None:
         }.items():
             if name not in cols:
                 conn.execute(f"ALTER TABLE pipeline_runs ADD COLUMN {name} {declaration}")
+        for table in ("scan_runs","market_audits"):
+            table_cols={r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            if "warning_type" not in table_cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN warning_type TEXT")
         _migrate_v05_snapshots(conn)
 
 
@@ -294,7 +298,8 @@ def stage_rows_for_run(run_id: int) -> list[dict]:
 
 def finish_scan_run(run_id: int, trade_date: str, status: str, message: str, counts: Mapping[str,int],
                     akshare_status: str, history_status: str, current_time: str, rows: list[Mapping],
-                    market_rows: list[Mapping] | None=None, market_environment: Mapping | None=None) -> int:
+                    market_rows: list[Mapping] | None=None, market_environment: Mapping | None=None,
+                    warning_type: str | None=None) -> int:
     now=utcnow()
     with transaction() as conn:
         if status in ("SUCCESS","WARNING"):
@@ -328,9 +333,9 @@ def finish_scan_run(run_id: int, trade_date: str, status: str, message: str, cou
                    e.get("low_position_pct"),e.get("distance_from_high_pct"),e.get("distance_from_low_pct"),
                    e.get("ma250_distance_pct"),e.get("recent_return_pct"),e.get("level_label"),e.get("status","WARNING"),
                    e.get("message"),e.get("source","tencent"),now))
-        conn.execute("""UPDATE scan_runs SET status=?,finished_at=?,message=?,fetched_at=?,akshare_status=?,history_status=?,
+        conn.execute("""UPDATE scan_runs SET status=?,finished_at=?,message=?,fetched_at=?,akshare_status=?,history_status=?,warning_type=?,
           pool_rows=?,cap_rows=?,repeated_rows=?,nonconsecutive_rows=?,low_rows=?,pullback_rows=?,pattern_rows=?,candidate_rows=? WHERE run_id=?""",
-          (status,now,message,now,akshare_status,history_status,counts.get("pool_rows",0),counts.get("cap_rows",0),counts.get("repeated_rows",0),
+          (status,now,message,now,akshare_status,history_status,warning_type,counts.get("pool_rows",0),counts.get("cap_rows",0),counts.get("repeated_rows",0),
            counts.get("nonconsecutive_rows",0),counts.get("low_rows",0),counts.get("pullback_rows",0),counts.get("pattern_rows",0),counts.get("candidate_rows",0),run_id))
     mark_pipeline_finish(trade_date,status,message,counts,akshare_status,history_status,current_time)
     return int(counts.get("candidate_rows",0))
