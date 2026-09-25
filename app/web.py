@@ -22,7 +22,7 @@ from .db import (active_run_for_date, connect, get_news_cache, init_db, publishe
 from .datasource import AKShareSource
 from .sync import DataValidationError, sync_market_day
 
-app = FastAPI(title="A股低位多涨停筛选器", version="0.6.0")
+app = FastAPI(title="A股低位多涨停筛选器", version="0.7.0")
 app.mount("/static",StaticFiles(directory=str(Path(__file__).parent / "static")),name="static")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 security = HTTPBasic(auto_error=False)

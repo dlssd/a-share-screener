@@ -91,32 +91,43 @@ def _market_panorama(source: AKShareSource, universe: list[dict], trade_date: st
     rows=[]
     for item in universe:
         symbol=str(item["symbol"]); frame=histories.get(symbol); dates=[]; status="DATA_UNAVAILABLE"
-        open_=high=low=pct=None
+        open_=high=low=pct=history_previous=None
         if frame is not None and not frame.empty:
             detection=detect_limit_up_days(frame,symbol,item["name"]); status=detection.status
             dates=[d for d in detection.dates if d in recent_calendar]
             last=frame.iloc[-1]; open_=float(last["open"]); high=float(last["high"]); low=float(last["low"])
             pct=float(last.get("pct_chg")) if pd.notna(last.get("pct_chg")) else None
+            if len(frame)>=2: history_previous=float(frame.iloc[-2]["raw_close"])
         trailing=0
         for day in reversed(recent_calendar):
             if day in dates: trailing+=1
             else: break
         rate=limit_rate(symbol,str(item["name"])); expected=None
-        previous=item.get("previous_close")
+        previous=item.get("previous_close") if item.get("previous_close") is not None else history_previous
         if rate is not None and previous is not None and pd.notna(previous):
             expected=theoretical_limit_price(float(previous),rate)
-        at_limit=lambda value: expected is not None and value is not None and abs(value-expected)<=.0051
-        t_board=bool(at_limit(open_) and at_limit(high) and at_limit(float(item["raw_close"])) and low is not None and low<expected-.0051)
-        one_word=bool(at_limit(open_) and at_limit(high) and at_limit(low) and at_limit(float(item["raw_close"])))
-        board_label="首板" if trailing<=1 else (f"{trailing}板" if trailing<4 else "4板及以上")
+        labels=(classify_limit_board(open_,high,low,float(item["raw_close"]),expected,max(trailing,1))
+                if expected is not None and None not in (open_,high,low) else
+                {"board_label":"首板" if trailing<=1 else (f"{trailing}板" if trailing<4 else "4板及以上"),
+                 "is_t_board":False,"is_one_word":False})
         cache=get_industry_cache(symbol)
         industry=item.get("industry") or (cache["industry"] if cache else None)
         rows.append({"symbol":symbol,"name":item["name"],"industry":industry,"market":item.get("market","UNKNOWN"),
           "close":item.get("raw_close"),"total_market_cap_yi":float(item["total_market_cap"])/1e8 if item.get("total_market_cap") else None,
           "pct_chg":pct,"recent_limit_count":len(dates),"consecutive_boards":max(trailing,1),
-          "board_label":board_label,"is_t_board":t_board,"is_one_word":one_word,"limit_dates":dates,
+          "board_label":labels["board_label"],"is_t_board":labels["is_t_board"],"is_one_word":labels["is_one_word"],"limit_dates":dates,
           "verification_status":status,"source":item.get("source","eastmoney+tencent")})
     return rows,histories,errors
+
+
+def classify_limit_board(open_price: float, high: float, low: float, close: float,
+                         limit_price: float, consecutive_boards: int) -> dict:
+    """Strict daily-OHLC labels. Equality uses half a cent for exchange tick rounding."""
+    at_limit=lambda value: abs(float(value)-float(limit_price))<=.0051
+    return {"board_label":"首板" if consecutive_boards<=1 else
+            (f"{consecutive_boards}板" if consecutive_boards<4 else "4板及以上"),
+            "is_t_board":at_limit(open_price) and at_limit(high) and at_limit(close) and low<limit_price-.0051,
+            "is_one_word":all(at_limit(value) for value in (open_price,high,low,close))}
 
 
 def _index_environment(source: AKShareSource, trade_date: str) -> dict:
