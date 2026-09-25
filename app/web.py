@@ -13,20 +13,34 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
 from .config import settings
 from .calendar import CalendarUnavailable, is_trade_date, month_days, next_trade_date, previous_trade_date
 from .db import (active_run_for_date, connect, get_news_cache, init_db, published_dates,
                  published_run_for_date, save_news_cache, stage_rows_for_run,
                  market_rows_for_run, market_environment_for_run)
+from .db import (reviews_for_date, save_manual_review, get_profile_cache, save_profile_cache,
+                 get_fundamental_cache, save_fundamental_cache)
 from .datasource import AKShareSource
+from .profile import build_profile
 from .sync import DataValidationError, sync_market_day
 
-app = FastAPI(title="A股低位多涨停筛选器", version="0.7.1")
+app = FastAPI(title="A股低位多涨停筛选器", version="0.8.0")
 app.mount("/static",StaticFiles(directory=str(Path(__file__).parent / "static")),name="static")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 security = HTTPBasic(auto_error=False)
 refresh_lock = threading.Lock()
+RATINGS={"FOCUS","NORMAL","REJECT","UNSET"}
+REASONS={"位置好","T字板","题材好","业绩好","前期有大行情","放量明显","位置偏高","连板过多","其他"}
+
+
+class ReviewPayload(BaseModel):
+    trade_date: str
+    symbol: str
+    rating: str
+    reasons: list[str]=Field(default_factory=list)
+    note: str=""
 WARNING_LABELS={
     "HISTORICAL_REBUILD":"历史重建结果，可能受免费数据源历史覆盖限制",
     "CURRENT_SOURCE_DEGRADED":"当前主数据源异常，已使用降级核验路径",
@@ -142,6 +156,12 @@ def index(request: Request, date: Optional[str] = None):
     watch=sorted((r for r in stages if r["passes_nonconsecutive"] and not r["passes_final"]),key=_watch_score)
     repeated=sorted((r for r in stages if r["passes_repeat_limit"]),key=lambda r:(r["has_consecutive_limit_up"],-r["limit_up_count"],r["symbol"]))
     market_rows=market_rows_for_run(int(selected["run_id"])) if selected else []
+    reviews=reviews_for_date(chosen) if chosen else {}
+    for row in market_rows:
+        review=reviews.get(row["symbol"],{"rating":"UNSET","reasons":[],"note":""})
+        row["review"]=review
+    review_counts={rating:sum(r["review"]["rating"]==rating for r in market_rows) for rating in RATINGS}
+    review_counts["reviewed"]=len(market_rows)-review_counts["UNSET"]
     environment=market_environment_for_run(int(selected["run_id"])) if selected else None
     warning_type=_warning_type(selected); warning_label=WARNING_LABELS.get(warning_type)
     market_complete=bool(selected and selected["status"]=="SUCCESS" and selected["akshare_status"]=="SUCCESS")
@@ -163,6 +183,8 @@ def index(request: Request, date: Optional[str] = None):
             "official":official,"watch":watch,"repeated":repeated,"cap_rows":stages,
             "market_rows":market_rows,"board_stats":board_stats,"industries":industries,"environment":environment,
             "warning_type":warning_type,"warning_label":warning_label,"market_complete":market_complete,
+            "review_counts":review_counts,"review_reasons":sorted(REASONS),
+            "reviews":reviews,
             "chosen_date": chosen,
             "selected":dict(selected) if selected else None,
             "active":dict(active) if active else None,
@@ -224,6 +246,51 @@ def news(symbol: str):
         return {"symbol":symbol,"cached":False,"items":items}
     except Exception:
         return JSONResponse({"symbol":symbol,"message":"资讯暂时无法获取"},status_code=502)
+
+
+@app.post("/api/reviews", dependencies=[Depends(auth)])
+def save_review(payload: ReviewPayload):
+    trade_date=payload.trade_date.replace("-",""); symbol=payload.symbol.zfill(6); rating=payload.rating.upper()
+    if len(trade_date)!=8 or not trade_date.isdigit() or rating not in RATINGS:
+        raise HTTPException(400,"人工复盘参数无效")
+    invalid=set(payload.reasons)-REASONS
+    if invalid: raise HTTPException(400,f"未知复盘原因: {', '.join(sorted(invalid))}")
+    with connect() as conn:
+        exists=conn.execute("""SELECT 1 FROM published_snapshots p JOIN market_limit_results m ON m.run_id=p.run_id
+                               WHERE p.trade_date=? AND m.symbol=?""",(trade_date,symbol)).fetchone()
+    if not exists: raise HTTPException(404,"该股票不在所选日期的已识别涨停列表")
+    return {"ok":True,"review":save_manual_review(trade_date,symbol,rating,payload.reasons,payload.note[:1000])}
+
+
+@app.get("/api/details/{symbol}", dependencies=[Depends(auth)])
+def stock_details(symbol: str, date: str):
+    symbol=str(symbol).zfill(6); as_of=date.replace("-","")
+    with connect() as conn:
+        row=conn.execute("""SELECT m.* FROM published_snapshots p JOIN market_limit_results m ON m.run_id=p.run_id
+                            WHERE p.trade_date=? AND m.symbol=?""",(as_of,symbol)).fetchone()
+    if not row: raise HTTPException(404,"未找到该日股票记录")
+    profile_cached=get_profile_cache(symbol,as_of)
+    if profile_cached:
+        profile=json.loads(profile_cached["profile_json"])
+    else:
+        try:
+            history=AKShareSource().tencent_history(symbol,"20100101",as_of,adjusted=True)
+            profile=build_profile(history,as_of); save_profile_cache(symbol,as_of,profile,"tencent_qfq")
+        except Exception as exc:
+            profile={"available":False,"message":"历史画像暂不可用","technical":f"{type(exc).__name__}: {exc}"}
+    fundamental_cached=get_fundamental_cache(symbol,as_of)
+    if fundamental_cached:
+        fundamental=dict(fundamental_cached); fundamental["available"]=True
+    else:
+        try:
+            fundamental=AKShareSource().fundamental_summary(symbol,as_of)
+            save_fundamental_cache(symbol,as_of,fundamental,"eastmoney_financial_indicator_em")
+            fundamental={**fundamental,"available":True}
+        except Exception as exc:
+            fundamental={"available":False,"message":"基本面暂不可用","technical":f"{type(exc).__name__}: {exc}"}
+    item=dict(row); item["limit_dates"]=json.loads(item.pop("limit_dates_json"))
+    return {"stock":item,"profile":profile,"fundamental":fundamental,
+            "review":reviews_for_date(as_of).get(symbol,{"rating":"UNSET","reasons":[],"note":""})}
 
 
 @app.get("/healthz")

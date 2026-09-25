@@ -199,6 +199,26 @@ class AKShareSource:
                            "source":str(row.get(source,"")) if source else ""})
         return result
 
+    def fundamental_summary(self, symbol: str, as_of_date: str) -> dict:
+        """Latest report publicly noticed by as_of_date; Eastmoney free financial indicators."""
+        def fetch():
+            import akshare as ak
+            suffix="SH" if str(symbol).startswith(("5","6")) else ("BJ" if str(symbol).startswith("9") else "SZ")
+            with _requests_timeout(settings.request_timeout):
+                return ak.stock_financial_analysis_indicator_em(symbol=f"{str(symbol).zfill(6)}.{suffix}",indicator="按报告期")
+        raw=_retry(f"Eastmoney fundamental {symbol}",fetch)
+        if raw is None or raw.empty: raise DataSourceError(f"fundamental {symbol}: empty")
+        data=raw.copy(); data["NOTICE_DATE"]=pd.to_datetime(data["NOTICE_DATE"],errors="coerce")
+        cutoff=pd.to_datetime(as_of_date); data=data[data["NOTICE_DATE"]<=cutoff].sort_values("REPORT_DATE",ascending=False)
+        if data.empty: raise DataSourceError(f"fundamental {symbol}: no report available by {as_of_date}")
+        row=data.iloc[0]
+        number=lambda key: None if key not in row or pd.isna(row[key]) else float(row[key])
+        profit=number("PARENTNETPROFIT")
+        return {"report_date":pd.to_datetime(row["REPORT_DATE"]).strftime("%Y-%m-%d"),
+                "revenue":number("TOTALOPERATEREVE"),"revenue_yoy":number("TOTALOPERATEREVETZ"),
+                "net_profit":profit,"net_profit_yoy":number("PARENTNETPROFITTZ"),
+                "profit_status":"盈利" if profit is not None and profit>=0 else "亏损"}
+
     def tencent_history(self, symbol: str, start_date: str, end_date: str, *, adjusted: bool) -> pd.DataFrame:
         def fetch():
             import akshare as ak

@@ -84,3 +84,20 @@ def test_default_database_path_is_project_root_based(monkeypatch, tmp_path):
         assert before.parent==PROJECT_ROOT/"data"
     finally:
         object.__setattr__(settings,"db_path",original)
+
+
+def test_manual_review_survives_force_style_new_scan_run(tmp_path):
+    original=settings.db_path; object.__setattr__(settings,"db_path",str(tmp_path/"manual.db"))
+    try:
+        db.init_db(); db.save_manual_review("20260924","601567","FOCUS",["位置好"],"等回调")
+        first=db.start_scan_run("20260924","now")
+        db.finish_scan_run(first,"20260924","WARNING","old",{},"WARNING","SUCCESS","now",[])
+        second=db.start_scan_run("20260924","now")
+        db.finish_scan_run(second,"20260924","SUCCESS","new",{},"SUCCESS","SUCCESS","now",[])
+        review=db.reviews_for_date("20260924")["601567"]
+        assert review["rating"]=="FOCUS" and review["note"]=="等回调"
+        db.save_manual_review("20260921","601567","REJECT",["位置偏高"],"")
+        assert db.reviews_for_date("20260921")["601567"]["rating"]=="REJECT"
+        assert db.reviews_for_date("20260924")["601567"]["rating"]=="FOCUS"
+    finally:
+        object.__setattr__(settings,"db_path",original)

@@ -159,3 +159,48 @@ def test_warning_type_friendly_labels():
     assert web_module.WARNING_LABELS["HISTORICAL_REBUILD"].startswith("历史重建结果")
     assert "主数据源异常" in web_module.WARNING_LABELS["CURRENT_SOURCE_DEGRADED"]
     assert "双源核验" in web_module.WARNING_LABELS["PARTIAL_VERIFICATION"]
+
+
+def test_manual_review_api_and_cached_detail(tmp_path, monkeypatch):
+    original=settings.db_path; object.__setattr__(settings,"db_path",str(tmp_path/"detail.db"))
+    market={"symbol":"601567","name":"三星电气","industry":"电网设备","market":"MAIN","close":42.3,
+            "total_market_cap_yi":228.3,"pct_chg":10.0,"recent_limit_count":2,"consecutive_boards":1,
+            "board_label":"首板","is_t_board":False,"is_one_word":False,"limit_dates":["20260914","20260924"],
+            "verification_status":"VERIFIED"}
+    profile={"as_of_date":"20260924","last_trade_date":"20260924","observations":1250,
+             "one_year":{"available":True,"position":.2,"distance_from_high":-.3,"distance_from_low":.1},
+             "three_year":{"available":True,"position":.3,"distance_from_high":-.4,"distance_from_low":.2},
+             "five_year":{"available":True,"position":.4,"distance_from_high":-.5,"distance_from_low":.3},
+             "ma250":{"available":True,"distance":.01,"direction":"上行"},"maximum_rise_5y":None}
+    try:
+        db.init_db(); run=db.start_scan_run("20260924","now")
+        db.finish_scan_run(run,"20260924","SUCCESS","ok",{},"SUCCESS","SUCCESS","now",[],[market])
+        db.save_profile_cache("601567","20260924",profile,"test")
+        db.save_fundamental_cache("601567","20260924",{"report_date":"2026-06-30","revenue":1e9,
+            "revenue_yoy":5,"net_profit":1e8,"net_profit_yoy":3,"profit_status":"盈利"},"test")
+        client=TestClient(app)
+        saved=client.post("/api/reviews",json={"trade_date":"20260924","symbol":"601567","rating":"FOCUS",
+                                                "reasons":["位置好","业绩好"],"note":"等回调"})
+        assert saved.status_code==200 and saved.json()["review"]["rating"]=="FOCUS"
+        updated=client.post("/api/reviews",json={"trade_date":"20260924","symbol":"601567","rating":"NORMAL",
+                                                  "reasons":[],"note":"再观察"})
+        assert updated.status_code==200 and db.reviews_for_date("20260924")["601567"]["note"]=="再观察"
+        detail=client.get("/api/details/601567?date=20260924")
+        assert detail.status_code==200
+        assert detail.json()["profile"]["last_trade_date"]=="20260924"
+        assert detail.json()["fundamental"]["profit_status"]=="盈利"
+        page=client.get("/?date=20260924")
+        assert page.status_code==200 and "人工复盘进度" in page.text and "查看详情" in page.text
+    finally:
+        object.__setattr__(settings,"db_path",original)
+
+
+def test_fundamental_failure_does_not_affect_homepage(tmp_path, monkeypatch):
+    original=settings.db_path; object.__setattr__(settings,"db_path",str(tmp_path/"fundamental-failure.db"))
+    try:
+        db.init_db(); run=db.start_scan_run("20260924","now")
+        db.finish_scan_run(run,"20260924","SUCCESS","ok",{},"SUCCESS","SUCCESS","now",[])
+        monkeypatch.setattr(AKShareSource,"fundamental_summary",lambda *args,**kwargs: (_ for _ in ()).throw(RuntimeError("down")))
+        assert TestClient(app).get("/?date=20260924").status_code==200
+    finally:
+        object.__setattr__(settings,"db_path",original)

@@ -110,6 +110,18 @@ CREATE TABLE IF NOT EXISTS market_environment (
  close REAL, low_position_pct REAL, distance_from_high_pct REAL, distance_from_low_pct REAL,
  ma250_distance_pct REAL, recent_return_pct REAL, level_label TEXT, status TEXT NOT NULL,
  message TEXT, source TEXT NOT NULL, fetched_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS manual_reviews (
+ trade_date TEXT NOT NULL, symbol TEXT NOT NULL, rating TEXT NOT NULL DEFAULT 'UNSET',
+ reasons_json TEXT NOT NULL DEFAULT '[]', note TEXT NOT NULL DEFAULT '',
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(trade_date,symbol));
+CREATE TABLE IF NOT EXISTS stock_profile_cache (
+ symbol TEXT NOT NULL, as_of_date TEXT NOT NULL, profile_json TEXT NOT NULL,
+ source TEXT NOT NULL, fetched_at TEXT NOT NULL, PRIMARY KEY(symbol,as_of_date));
+CREATE TABLE IF NOT EXISTS stock_fundamental_cache (
+ symbol TEXT NOT NULL, as_of_date TEXT NOT NULL, report_date TEXT,
+ revenue REAL, revenue_yoy REAL, net_profit REAL, net_profit_yoy REAL,
+ profit_status TEXT, source TEXT NOT NULL, fetched_at TEXT NOT NULL,
+ PRIMARY KEY(symbol,as_of_date));
 """
 
 
@@ -388,6 +400,48 @@ def market_environment_for_run(run_id: int):
     with connect() as conn:
         row=conn.execute("SELECT * FROM market_environment WHERE run_id=?",(run_id,)).fetchone()
     return dict(row) if row else None
+
+
+def reviews_for_date(trade_date: str) -> dict[str,dict]:
+    init_db()
+    with connect() as conn: rows=conn.execute("SELECT * FROM manual_reviews WHERE trade_date=?",(trade_date,)).fetchall()
+    out={}
+    for row in rows:
+        item=dict(row); item["reasons"]=json.loads(item.pop("reasons_json")); out[item["symbol"]]=item
+    return out
+
+
+def save_manual_review(trade_date: str, symbol: str, rating: str, reasons: list[str], note: str) -> dict:
+    init_db(); now=utcnow()
+    with connect() as conn:
+        conn.execute("""INSERT INTO manual_reviews(trade_date,symbol,rating,reasons_json,note,created_at,updated_at)
+          VALUES(?,?,?,?,?,?,?) ON CONFLICT(trade_date,symbol) DO UPDATE SET rating=excluded.rating,
+          reasons_json=excluded.reasons_json,note=excluded.note,updated_at=excluded.updated_at""",
+          (trade_date,symbol,rating,json.dumps(reasons,ensure_ascii=False),note,now,now)); conn.commit()
+    return reviews_for_date(trade_date)[symbol]
+
+
+def get_profile_cache(symbol: str, as_of_date: str):
+    init_db()
+    with connect() as conn: return conn.execute("SELECT * FROM stock_profile_cache WHERE symbol=? AND as_of_date=?",(symbol,as_of_date)).fetchone()
+
+
+def save_profile_cache(symbol: str, as_of_date: str, profile: Mapping, source: str) -> None:
+    with connect() as conn:
+        conn.execute("INSERT OR REPLACE INTO stock_profile_cache VALUES(?,?,?,?,?)",
+                     (symbol,as_of_date,json.dumps(profile,ensure_ascii=False),source,utcnow())); conn.commit()
+
+
+def get_fundamental_cache(symbol: str, as_of_date: str):
+    init_db()
+    with connect() as conn: return conn.execute("SELECT * FROM stock_fundamental_cache WHERE symbol=? AND as_of_date=?",(symbol,as_of_date)).fetchone()
+
+
+def save_fundamental_cache(symbol: str, as_of_date: str, item: Mapping, source: str) -> None:
+    with connect() as conn:
+        conn.execute("INSERT OR REPLACE INTO stock_fundamental_cache VALUES(?,?,?,?,?,?,?,?,?,?)",
+          (symbol,as_of_date,item.get("report_date"),item.get("revenue"),item.get("revenue_yoy"),
+           item.get("net_profit"),item.get("net_profit_yoy"),item.get("profit_status"),source,utcnow())); conn.commit()
 
 
 def run_for_date(trade_date: str):
