@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -11,6 +12,13 @@ from .datasource import AKShareSource
 from .db import (connect, get_industry_cache, init_db, save_industry_cache,
                  transaction, upsert_dataframe, utcnow)
 from .limit_rules import detect_limit_up_days, market_for_symbol, theoretical_limit_price, limit_rate
+
+
+def _is_current_completed_day(trade_date: str, now: datetime | None=None) -> bool:
+    """Interpret the market date exclusively in Asia/Shanghai, regardless of host timezone."""
+    china_tz=ZoneInfo(settings.timezone)
+    china_now=(now.astimezone(china_tz) if now is not None else datetime.now(china_tz))
+    return trade_date==china_now.strftime("%Y%m%d") and china_now.hour>=settings.publish_after_hour
 
 
 def _enabled(symbol: str) -> bool:
@@ -130,8 +138,7 @@ def build_market_audit(trade_date: str, *, force: bool=False) -> tuple[list[dict
             report=dict(cached_report); report["only_theoretical"]=json.loads(report.pop("only_theoretical_json")); report["only_pool"]=json.loads(report.pop("only_pool_json"))
             return cached_universe,report
     source=AKShareSource(); pool=source.limit_up_pool(trade_date); pool_symbols=set(pool["symbol"])
-    now=datetime.now().astimezone()
-    same_day=trade_date==now.strftime("%Y%m%d") and now.hour>=settings.publish_after_hour
+    same_day=_is_current_completed_day(trade_date)
     message=""; warning_type=None
     if same_day:
         try:
