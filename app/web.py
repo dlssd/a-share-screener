@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import secrets
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -12,14 +12,18 @@ from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
 
 from .config import settings
+from .calendar import CalendarUnavailable, is_trade_date, month_days, next_trade_date, previous_trade_date
 from .db import (active_run_for_date, connect, get_news_cache, init_db, published_dates,
-                 published_run_for_date, save_news_cache, stage_rows_for_run)
+                 published_run_for_date, save_news_cache, stage_rows_for_run,
+                 market_rows_for_run, market_environment_for_run)
 from .datasource import AKShareSource
 from .sync import DataValidationError, sync_market_day
 
 app = FastAPI(title="A股低位多涨停筛选器", version="0.6.0")
+app.mount("/static",StaticFiles(directory=str(Path(__file__).parent / "static")),name="static")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 security = HTTPBasic(auto_error=False)
 refresh_lock = threading.Lock()
@@ -97,8 +101,24 @@ def _watch_score(row: dict) -> tuple:
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(auth)])
 def index(request: Request, date: Optional[str] = None):
     dates=published_dates()
-    chosen=(date or (dates[-1] if dates else None))
-    if chosen not in dates and dates: chosen=dates[-1]
+    chosen=(date.replace("-", "") if date else (dates[-1] if dates else datetime.now(ZoneInfo(settings.timezone)).strftime("%Y%m%d")))
+    if len(chosen)!=8 or not chosen.isdigit():
+        raise HTTPException(400,"日期格式应为 YYYYMMDD")
+    try:
+        trade_day=is_trade_date(chosen)
+        previous_date=previous_trade_date(chosen)
+        next_date=next_trade_date(chosen)
+        days=month_days(chosen[:6])
+    except CalendarUnavailable:
+        trade_day=chosen in dates; previous_date=next_date=None; days=[]
+    published=set(dates)
+    for item in days: item["published"]=item["date"] in published
+    first=datetime.strptime(chosen[:6]+"01","%Y%m%d"); leading=first.weekday()
+    weeks=[]; cells=[None]*leading+days
+    while cells:
+        weeks.append(cells[:7]); cells=cells[7:]
+    now=datetime.now(ZoneInfo(settings.timezone)); today=now.strftime("%Y%m%d")
+    completed=chosen<today or (chosen==today and trade_day and now.hour>=settings.publish_after_hour)
     selected=published_run_for_date(chosen) if chosen else None
     active=active_run_for_date(chosen) if chosen else None
     valid=bool(selected)
@@ -106,19 +126,35 @@ def index(request: Request, date: Optional[str] = None):
     official=[r for r in stages if r["passes_final"]]
     watch=sorted((r for r in stages if r["passes_nonconsecutive"] and not r["passes_final"]),key=_watch_score)
     repeated=sorted((r for r in stages if r["passes_repeat_limit"]),key=lambda r:(r["has_consecutive_limit_up"],-r["limit_up_count"],r["symbol"]))
-    index_pos=dates.index(chosen) if chosen in dates else -1
+    market_rows=market_rows_for_run(int(selected["run_id"])) if selected else []
+    environment=market_environment_for_run(int(selected["run_id"])) if selected else None
+    board_stats={"first":sum(r["consecutive_boards"]<=1 for r in market_rows),
+                 "two":sum(r["consecutive_boards"]==2 for r in market_rows),
+                 "three":sum(r["consecutive_boards"]==3 for r in market_rows),
+                 "four_plus":sum(r["consecutive_boards"]>=4 for r in market_rows),
+                 "t":sum(bool(r["is_t_board"]) for r in market_rows),
+                 "one":sum(bool(r["is_one_word"]) for r in market_rows),
+                 "nonconsecutive":sum(r["recent_limit_count"]>=2 and r["consecutive_boards"]<=1 for r in market_rows)}
+    industry_counts={}
+    for row in market_rows:
+        key=row.get("industry") or "行业未知"; industry_counts[key]=industry_counts.get(key,0)+1
+    industries=sorted(industry_counts.items(),key=lambda x:(-x[1],x[0]))
     return templates.TemplateResponse(
         "index.html",
         {
             "request": request,
             "official":official,"watch":watch,"repeated":repeated,"cap_rows":stages,
+            "market_rows":market_rows,"board_stats":board_stats,"industries":industries,"environment":environment,
             "chosen_date": chosen,
             "selected":dict(selected) if selected else None,
             "active":dict(active) if active else None,
             "refreshing":bool(active and active["status"]=="RUNNING" and (not selected or active["run_id"]!=selected["run_id"])),
             "refresh_failed":bool(active and active["status"]=="FAILED" and selected and active["run_id"]!=selected["run_id"]),
-            "previous_date":dates[index_pos-1] if index_pos>0 else None,
-            "next_date":dates[index_pos+1] if 0<=index_pos<len(dates)-1 else None,
+            "previous_date":previous_date,"next_date":next_date,
+            "is_trade_day":trade_day,"is_completed":completed,"calendar_weeks":weeks,
+            "calendar_month":chosen[:6],"published_dates":published,
+            "previous_month":(first-timedelta(days=1)).strftime('%Y%m'),
+            "next_month":((first.replace(day=28)+timedelta(days=4)).replace(day=1)).strftime('%Y%m'),
             "settings": settings,
         },
     )
@@ -141,7 +177,7 @@ def refresh_latest(date: Optional[str] = None):
     try:
         trade_date=(date or (published_dates()[-1] if published_dates() else None))
         if not trade_date or len(trade_date.replace("-","")) != 8:
-            return JSONResponse({"ok":False,"message":"请先选择一个已有的交易日。"},status_code=400)
+            return JSONResponse({"ok":False,"message":"请先选择日期。"},status_code=400)
         trade_date=trade_date.replace("-","")
         sync_market_day(trade_date,run_scan=True,force=True)
         run=published_run_for_date(trade_date)

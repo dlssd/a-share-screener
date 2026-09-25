@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from .audit import build_market_audit
+from .calendar import is_trade_date, trade_dates_between
 from .config import settings
 from .datasource import AKShareSource
 from .db import (connect, fail_scan_run, finish_scan_run, get_industry_cache, init_db,
                  pipeline_success, save_industry_cache, start_scan_run)
-from .limit_rules import INSUFFICIENT_HISTORY, UNKNOWN_LIMIT_RULE, detect_limit_up_days
+from .limit_rules import (INSUFFICIENT_HISTORY, UNKNOWN_LIMIT_RULE, detect_limit_up_days,
+                          theoretical_limit_price, limit_rate)
 from .scanner import ScanParams, evaluate_stages, has_consecutive_limit_ups, verify_independent_source
 
 
@@ -24,7 +27,7 @@ def resolve_latest_completed_trade_date(source: AKShareSource | None=None, now: 
     source=source or AKShareSource(); now=now or shanghai_now()
     if now.tzinfo is None: now=now.replace(tzinfo=ZoneInfo(settings.timezone))
     today=now.strftime("%Y%m%d")
-    days=source.trading_days((now.date()-timedelta(days=45)).strftime("%Y%m%d"),today)
+    days=trade_dates_between((now.date()-timedelta(days=45)).strftime("%Y%m%d"),today,source)
     if today in days and now.hour<settings.publish_after_hour: days=[d for d in days if d<today]
     if not days: raise DataValidationError("没有可用的已完成交易日")
     return days[-1]
@@ -71,8 +74,74 @@ def _industry_for(source: AKShareSource, row: dict, warnings: list[str]) -> str 
     return value
 
 
+def _market_panorama(source: AKShareSource, universe: list[dict], trade_date: str,
+                     recent_calendar: list[str]) -> tuple[list[dict], dict[str,pd.DataFrame], list[str]]:
+    """Enrich every detected limit-up with short raw history; failures stay visible."""
+    start=(datetime.strptime(trade_date,"%Y%m%d")-timedelta(days=100)).strftime("%Y%m%d")
+    histories={}; errors=[]
+    def fetch(row):
+        return row["symbol"],source.tencent_history(row["symbol"],start,trade_date,adjusted=False)
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        futures={pool.submit(fetch,row):row for row in universe}
+        for future in as_completed(futures):
+            try:
+                symbol,frame=future.result(); histories[symbol]=frame
+            except Exception as exc:
+                errors.append(f"{futures[future]['symbol']} 全景历史失败: {type(exc).__name__}")
+    rows=[]
+    for item in universe:
+        symbol=str(item["symbol"]); frame=histories.get(symbol); dates=[]; status="DATA_UNAVAILABLE"
+        open_=high=low=pct=None
+        if frame is not None and not frame.empty:
+            detection=detect_limit_up_days(frame,symbol,item["name"]); status=detection.status
+            dates=[d for d in detection.dates if d in recent_calendar]
+            last=frame.iloc[-1]; open_=float(last["open"]); high=float(last["high"]); low=float(last["low"])
+            pct=float(last.get("pct_chg")) if pd.notna(last.get("pct_chg")) else None
+        trailing=0
+        for day in reversed(recent_calendar):
+            if day in dates: trailing+=1
+            else: break
+        rate=limit_rate(symbol,str(item["name"])); expected=None
+        previous=item.get("previous_close")
+        if rate is not None and previous is not None and pd.notna(previous):
+            expected=theoretical_limit_price(float(previous),rate)
+        at_limit=lambda value: expected is not None and value is not None and abs(value-expected)<=.0051
+        t_board=bool(at_limit(open_) and at_limit(high) and at_limit(float(item["raw_close"])) and low is not None and low<expected-.0051)
+        one_word=bool(at_limit(open_) and at_limit(high) and at_limit(low) and at_limit(float(item["raw_close"])))
+        board_label="首板" if trailing<=1 else (f"{trailing}板" if trailing<4 else "4板及以上")
+        cache=get_industry_cache(symbol)
+        industry=item.get("industry") or (cache["industry"] if cache else None)
+        rows.append({"symbol":symbol,"name":item["name"],"industry":industry,"market":item.get("market","UNKNOWN"),
+          "close":item.get("raw_close"),"total_market_cap_yi":float(item["total_market_cap"])/1e8 if item.get("total_market_cap") else None,
+          "pct_chg":pct,"recent_limit_count":len(dates),"consecutive_boards":max(trailing,1),
+          "board_label":board_label,"is_t_board":t_board,"is_one_word":one_word,"limit_dates":dates,
+          "verification_status":status,"source":item.get("source","eastmoney+tencent")})
+    return rows,histories,errors
+
+
+def _index_environment(source: AKShareSource, trade_date: str) -> dict:
+    start=(datetime.strptime(trade_date,"%Y%m%d")-timedelta(days=520)).strftime("%Y%m%d")
+    try:
+        frame=source.tencent_index_history(start,trade_date).sort_values("trade_date")
+        if frame.empty or frame.iloc[-1]["trade_date"]!=trade_date: raise DataValidationError("指数缺少目标日")
+        values=frame["raw_close"].dropna().tail(250); close=float(values.iloc[-1]); low=float(values.min()); high=float(values.max())
+        position=(close-low)/(high-low) if high>low else 0.0; ma=float(values.mean())
+        return {"symbol":"000001","name":"上证指数","close":close,"low_position_pct":position,
+          "distance_from_high_pct":close/high-1,"distance_from_low_pct":close/low-1,
+          "ma250_distance_pct":close/ma-1,"recent_return_pct":close/float(values.iloc[-20])-1,
+          "level_label":"低位" if position<=.3 else ("偏高" if position>=.7 else "中位"),
+          "status":"SUCCESS","message":"","source":"tencent_index_raw"}
+    except Exception as exc:
+        return {"symbol":"000001","name":"上证指数","status":"WARNING",
+                "message":f"指数数据暂不可用: {type(exc).__name__}","source":"tencent_index_raw"}
+
+
 def sync_market_day(trade_date: str, *, run_scan: bool=True, force: bool=False) -> int:
-    init_db(); source=AKShareSource(); now=shanghai_now(); latest=resolve_latest_completed_trade_date(source,now)
+    trade_date=trade_date.replace("-", "")
+    init_db(); source=AKShareSource(); now=shanghai_now()
+    if not is_trade_date(trade_date,source):
+        raise DataValidationError(f"{trade_date} 为A股休市日，不能生成盘后复盘")
+    latest=resolve_latest_completed_trade_date(source,now)
     if trade_date>latest: raise DataValidationError(f"{trade_date} 尚非完整盘后交易日；最近完整日为 {latest}")
     if pipeline_success(trade_date) and not force:
         with connect() as conn: return int(conn.execute("SELECT candidate_rows FROM pipeline_runs WHERE trade_date=?",(trade_date,)).fetchone()[0])
@@ -85,8 +154,11 @@ def sync_market_day(trade_date: str, *, run_scan: bool=True, force: bool=False) 
         counts["pool_rows"]=len(universe)
         if audit["status"]=="WARNING": warnings.append("全市场审计为 WARNING: "+audit.get("message", ""))
         cap=[r for r in universe if r.get("total_market_cap") is not None and float(r["total_market_cap"])>=settings.market_cap_min_cny]
-        counts["cap_rows"]=len(cap); recent_calendar=source.trading_days(
-            (datetime.strptime(trade_date,"%Y%m%d")-timedelta(days=60)).strftime("%Y%m%d"),trade_date)[-settings.recent_trading_days:]
+        counts["cap_rows"]=len(cap); recent_calendar=trade_dates_between(
+            (datetime.strptime(trade_date,"%Y%m%d")-timedelta(days=60)).strftime("%Y%m%d"),trade_date,source)[-settings.recent_trading_days:]
+        market_rows,raw_histories,panorama_errors=_market_panorama(source,universe,trade_date,recent_calendar)
+        warnings.extend(panorama_errors[:5]); market_environment=_index_environment(source,trade_date)
+        if market_environment["status"]!="SUCCESS": warnings.append(market_environment["message"])
         stage_rows=[]
         params=ScanParams.from_settings()
         for row in cap:
@@ -101,7 +173,8 @@ def sync_market_day(trade_date: str, *, run_scan: bool=True, force: bool=False) 
               "reject_reasons":[]}
             stage["industry"]=industry
             try:
-                tx_raw=_history(source,symbol,trade_date,"tencent",False)
+                tx_raw=raw_histories.get(symbol)
+                if tx_raw is None: tx_raw=_history(source,symbol,trade_date,"tencent",False)
                 sina_raw=_history(source,symbol,trade_date,"sina",False)
                 tx_detection=detect_limit_up_days(tx_raw,symbol,row["name"])
                 sina_detection=detect_limit_up_days(sina_raw,symbol,row["name"])
@@ -189,7 +262,8 @@ def sync_market_day(trade_date: str, *, run_scan: bool=True, force: bool=False) 
         history_status="SUCCESS" if not any(UNKNOWN_LIMIT_RULE in w or INSUFFICIENT_HISTORY in w for w in warnings) else "WARNING"
         status="WARNING" if warnings or any(r["verification_status"]=="DATA_MISMATCH" for r in stage_rows) else "SUCCESS"
         message="；".join(warnings[:8]) if warnings else "理论涨停、腾讯历史重建、腾讯/新浪核验完成"
-        return finish_scan_run(run_id,trade_date,status,message,counts,audit["status"],history_status,current_time,stage_rows)
+        return finish_scan_run(run_id,trade_date,status,message,counts,audit["status"],history_status,current_time,stage_rows,
+                               market_rows,market_environment)
     except Exception as exc:
         fail_scan_run(run_id,trade_date,f"{type(exc).__name__}: {exc}",current_time)
         raise
@@ -201,3 +275,16 @@ def sync_latest_if_needed(force: bool=False) -> str:
 
 def backfill(trading_days: int=25, *, force: bool=False) -> list[str]:
     day=sync_latest_if_needed(force=force); return [day]
+
+
+def backfill_range(start_date: str, end_date: str, *, force: bool=False) -> list[str]:
+    """Run only exchange trading days; published snapshots remain immutable until replacement succeeds."""
+    days=trade_dates_between(start_date,end_date)
+    completed=resolve_latest_completed_trade_date()
+    done=[]
+    for day in days:
+        if day>completed:
+            continue
+        sync_market_day(day,force=force)
+        done.append(day)
+    return done

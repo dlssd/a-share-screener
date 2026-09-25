@@ -100,3 +100,37 @@ def test_running_and_failed_update_keep_published_page(tmp_path):
         assert "本次更新失败" in page.text and "当前展示上一次成功结果" in page.text and "三星电气" in page.text
     finally:
         object.__setattr__(settings,"db_path",original)
+
+
+def test_unpublished_trade_date_is_not_replaced_by_latest(tmp_path, monkeypatch):
+    original=settings.db_path; object.__setattr__(settings,"db_path",str(tmp_path/"calendar-web.db"))
+    try:
+        db.init_db(); run=db.start_scan_run("20260924","now")
+        db.finish_scan_run(run,"20260924","SUCCESS","ok",{"candidate_rows":0},"SUCCESS","SUCCESS","now",[])
+        monkeypatch.setattr(web_module,"is_trade_date",lambda date: date=="20260921")
+        monkeypatch.setattr(web_module,"previous_trade_date",lambda date:"20260918")
+        monkeypatch.setattr(web_module,"next_trade_date",lambda date:"20260922")
+        monkeypatch.setattr(web_module,"month_days",lambda month:[
+            {"date":"20260921","is_trade":True},{"date":"20260922","is_trade":True}])
+        page=TestClient(app).get("/?date=20260921")
+        assert page.status_code==200
+        assert "2026-09-21 尚未生成盘后复盘" in page.text
+        assert "生成 09-21 复盘" in page.text
+        assert "2026-09-24 盘后复盘" not in page.text
+    finally:
+        object.__setattr__(settings,"db_path",original)
+
+
+def test_closed_date_has_no_run_button(tmp_path, monkeypatch):
+    original=settings.db_path; object.__setattr__(settings,"db_path",str(tmp_path/"closed-web.db"))
+    try:
+        db.init_db()
+        monkeypatch.setattr(web_module,"is_trade_date",lambda date:False)
+        monkeypatch.setattr(web_module,"previous_trade_date",lambda date:"20260925")
+        monkeypatch.setattr(web_module,"next_trade_date",lambda date:"20260928")
+        monkeypatch.setattr(web_module,"month_days",lambda month:[{"date":"20260926","is_trade":False}])
+        page=TestClient(app).get("/?date=20260926")
+        assert "当日A股休市，无需生成复盘" in page.text
+        assert "生成 09-26 复盘" not in page.text
+    finally:
+        object.__setattr__(settings,"db_path",original)

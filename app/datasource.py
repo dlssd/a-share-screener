@@ -211,6 +211,14 @@ class AKShareSource:
         raw = _retry(f"Tencent history {symbol}", fetch)
         return self._normalize_history(raw, symbol, "tencent", adjusted)
 
+    def tencent_index_history(self, start_date: str, end_date: str) -> pd.DataFrame:
+        def fetch():
+            import akshare as ak
+            with _requests_timeout(settings.request_timeout):
+                return ak.stock_zh_a_hist_tx(symbol="sh000001",start_date=start_date,end_date=end_date,
+                                             adjust="",timeout=settings.request_timeout)
+        return self._normalize_history(_retry("Tencent Shanghai index",fetch),"000001","tencent_index",False)
+
     @staticmethod
     def _tencent_bse_history(symbol: str, start_date: str, end_date: str, adjusted: bool) -> pd.DataFrame:
         """Tencent's public endpoint supports BJ symbols, while AKShare's
