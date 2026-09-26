@@ -39,5 +39,9 @@ def build_profile(frame: pd.DataFrame, as_of_date: str) -> dict:
     five_values=values.tail(1250); five_dates=dates.tail(1250); rise=maximum_rise(five_values,five_dates)
     if rise:
         rise["current_from_high"]=float(values.iloc[-1])/rise["high_price"]-1
+    if rise:
+        rise["label"]="近5年最大上涨" if len(values)>=1250 else "可用历史最大上涨"
+        rise["observation_days"]=min(len(values),1250)
+        rise["approx_years"]=round(rise["observation_days"]/250,1)
     result["maximum_rise_5y"]=rise if len(values)>=2 else None
     return result

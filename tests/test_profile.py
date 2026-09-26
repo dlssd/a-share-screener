@@ -30,3 +30,10 @@ def test_maximum_rise_requires_low_before_high():
     result=maximum_rise(values,dates)
     assert result["gain"]==1.25
     assert result["low_date"]=="2" and result["high_date"]=="5"
+
+
+def test_short_history_is_not_labeled_as_full_five_years():
+    frame=_frame(612); profile=build_profile(frame,frame.iloc[-1]["trade_date"]); rise=profile["maximum_rise_5y"]
+    assert rise["label"]=="可用历史最大上涨"
+    assert rise["observation_days"]==612
+    assert not profile["five_year"]["available"]

@@ -24,9 +24,9 @@ from .db import (reviews_for_date, save_manual_review, get_profile_cache, save_p
                  get_fundamental_cache, save_fundamental_cache)
 from .datasource import AKShareSource
 from .profile import build_profile
-from .sync import DataValidationError, sync_market_day
+from .sync import DataValidationError, resolve_latest_completed_trade_date, sync_market_day
 
-app = FastAPI(title="A股低位多涨停筛选器", version="0.8.0")
+app = FastAPI(title="A股低位多涨停筛选器", version="0.8.1")
 app.mount("/static",StaticFiles(directory=str(Path(__file__).parent / "static")),name="static")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 security = HTTPBasic(auto_error=False)
@@ -234,8 +234,16 @@ def refresh_latest(date: Optional[str] = None):
 
 
 @app.get("/api/news/{symbol}", dependencies=[Depends(auth)])
-def news(symbol: str):
+def news(symbol: str, as_of_date: Optional[str]=None):
     symbol=str(symbol).zfill(6)
+    if as_of_date:
+        as_of_date=as_of_date.replace("-","")
+        dates=published_dates()
+        try: latest=resolve_latest_completed_trade_date()
+        except Exception: latest=dates[-1] if dates else None
+        if latest and as_of_date<latest:
+            return {"symbol":symbol,"as_of_date":as_of_date,"withheld":True,"items":[],
+                    "message":"为避免未来信息影响历史复盘，本日期不展示当前资讯。"}
     query_date=datetime.now(ZoneInfo(settings.timezone)).strftime("%Y%m%d")
     cached=get_news_cache(symbol,query_date)
     if cached:
@@ -272,6 +280,11 @@ def stock_details(symbol: str, date: str):
     profile_cached=get_profile_cache(symbol,as_of)
     if profile_cached:
         profile=json.loads(profile_cached["profile_json"])
+        rise=profile.get("maximum_rise_5y")
+        if rise and "label" not in rise:
+            days=min(int(profile.get("observations",0)),1250)
+            rise.update({"label":"近5年最大上涨" if days>=1250 else "可用历史最大上涨",
+                         "observation_days":days,"approx_years":round(days/250,1)})
     else:
         try:
             history=AKShareSource().tencent_history(symbol,"20100101",as_of,adjusted=True)

@@ -113,7 +113,8 @@ CREATE TABLE IF NOT EXISTS market_environment (
 CREATE TABLE IF NOT EXISTS manual_reviews (
  trade_date TEXT NOT NULL, symbol TEXT NOT NULL, rating TEXT NOT NULL DEFAULT 'UNSET',
  reasons_json TEXT NOT NULL DEFAULT '[]', note TEXT NOT NULL DEFAULT '',
- created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(trade_date,symbol));
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, review_timing TEXT NOT NULL DEFAULT 'HINDSIGHT',
+ PRIMARY KEY(trade_date,symbol));
 CREATE TABLE IF NOT EXISTS stock_profile_cache (
  symbol TEXT NOT NULL, as_of_date TEXT NOT NULL, profile_json TEXT NOT NULL,
  source TEXT NOT NULL, fetched_at TEXT NOT NULL, PRIMARY KEY(symbol,as_of_date));
@@ -161,6 +162,9 @@ def init_db() -> None:
             table_cols={r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
             if "warning_type" not in table_cols:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN warning_type TEXT")
+        review_cols={r[1] for r in conn.execute("PRAGMA table_info(manual_reviews)")}
+        if "review_timing" not in review_cols:
+            conn.execute("ALTER TABLE manual_reviews ADD COLUMN review_timing TEXT NOT NULL DEFAULT 'HINDSIGHT'")
         _migrate_v05_snapshots(conn)
 
 
@@ -411,13 +415,21 @@ def reviews_for_date(trade_date: str) -> dict[str,dict]:
     return out
 
 
+def review_timing(trade_date: str, created_at: str | None=None) -> str:
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+    created=datetime.fromisoformat(created_at or utcnow()).astimezone(ZoneInfo(settings.timezone)).date()
+    target=datetime.strptime(trade_date,"%Y%m%d").date()
+    return "LIVE" if target<=created<=target+timedelta(days=1) else "HINDSIGHT"
+
+
 def save_manual_review(trade_date: str, symbol: str, rating: str, reasons: list[str], note: str) -> dict:
-    init_db(); now=utcnow()
+    init_db(); now=utcnow(); timing=review_timing(trade_date,now)
     with connect() as conn:
-        conn.execute("""INSERT INTO manual_reviews(trade_date,symbol,rating,reasons_json,note,created_at,updated_at)
-          VALUES(?,?,?,?,?,?,?) ON CONFLICT(trade_date,symbol) DO UPDATE SET rating=excluded.rating,
+        conn.execute("""INSERT INTO manual_reviews(trade_date,symbol,rating,reasons_json,note,created_at,updated_at,review_timing)
+          VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(trade_date,symbol) DO UPDATE SET rating=excluded.rating,
           reasons_json=excluded.reasons_json,note=excluded.note,updated_at=excluded.updated_at""",
-          (trade_date,symbol,rating,json.dumps(reasons,ensure_ascii=False),note,now,now)); conn.commit()
+          (trade_date,symbol,rating,json.dumps(reasons,ensure_ascii=False),note,now,now,timing)); conn.commit()
     return reviews_for_date(trade_date)[symbol]
 
 

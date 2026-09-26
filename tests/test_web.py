@@ -204,3 +204,25 @@ def test_fundamental_failure_does_not_affect_homepage(tmp_path, monkeypatch):
         assert TestClient(app).get("/?date=20260924").status_code==200
     finally:
         object.__setattr__(settings,"db_path",original)
+
+
+def test_historical_news_is_withheld_but_latest_news_still_loads(tmp_path, monkeypatch):
+    original=settings.db_path; object.__setattr__(settings,"db_path",str(tmp_path/"news-lookahead.db"))
+    try:
+        db.init_db()
+        for date in ("20260921","20260924"):
+            run=db.start_scan_run(date,"now")
+            db.finish_scan_run(run,date,"SUCCESS","ok",{},"SUCCESS","SUCCESS","now",[])
+        calls=[]
+        monkeypatch.setattr(web_module,"resolve_latest_completed_trade_date",lambda:"20260924")
+        monkeypatch.setattr(AKShareSource,"news",lambda self,symbol:(calls.append(symbol) or
+            [{"title":"09-24新闻","published_at":"2026-09-24 10:00","source":"测试"}]))
+        client=TestClient(app)
+        historical=client.get("/api/news/601567?as_of_date=20260921")
+        assert historical.status_code==200 and historical.json()["withheld"] is True
+        assert historical.json()["items"]==[] and calls==[]
+        latest=client.get("/api/news/601567?as_of_date=20260924")
+        assert latest.status_code==200 and latest.json()["items"][0]["published_at"].startswith("2026-09-24")
+        assert calls==["601567"]
+    finally:
+        object.__setattr__(settings,"db_path",original)

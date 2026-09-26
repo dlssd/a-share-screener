@@ -101,3 +101,8 @@ def test_manual_review_survives_force_style_new_scan_run(tmp_path):
         assert db.reviews_for_date("20260924")["601567"]["rating"]=="FOCUS"
     finally:
         object.__setattr__(settings,"db_path",original)
+
+
+def test_historical_review_is_marked_hindsight():
+    assert db.review_timing("20260921","2026-09-26T02:00:00+00:00")=="HINDSIGHT"
+    assert db.review_timing("20260921","2026-09-21T12:00:00+00:00")=="LIVE"

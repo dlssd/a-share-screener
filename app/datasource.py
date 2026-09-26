@@ -16,6 +16,10 @@ class DataSourceError(RuntimeError):
     pass
 
 
+def profit_status(profit: float | None) -> str:
+    return "未知" if profit is None else ("盈利" if profit>0 else ("亏损" if profit<0 else "盈亏平衡"))
+
+
 @contextmanager
 def _deadline(seconds: float):
     """Hard wall-clock timeout for blocking BaoStock socket operations on macOS/Linux."""
@@ -214,10 +218,11 @@ class AKShareSource:
         row=data.iloc[0]
         number=lambda key: None if key not in row or pd.isna(row[key]) else float(row[key])
         profit=number("PARENTNETPROFIT")
+        status=profit_status(profit)
         return {"report_date":pd.to_datetime(row["REPORT_DATE"]).strftime("%Y-%m-%d"),
                 "revenue":number("TOTALOPERATEREVE"),"revenue_yoy":number("TOTALOPERATEREVETZ"),
                 "net_profit":profit,"net_profit_yoy":number("PARENTNETPROFITTZ"),
-                "profit_status":"盈利" if profit is not None and profit>=0 else "亏损"}
+                "profit_status":status}
 
     def tencent_history(self, symbol: str, start_date: str, end_date: str, *, adjusted: bool) -> pd.DataFrame:
         def fetch():
