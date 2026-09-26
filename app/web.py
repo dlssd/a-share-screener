@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
+import subprocess
+import sys
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -15,18 +18,20 @@ from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .config import settings
+from .config import PROJECT_ROOT, settings
 from .calendar import CalendarUnavailable, is_trade_date, month_days, next_trade_date, previous_trade_date
 from .db import (active_run_for_date, connect, get_news_cache, init_db, published_dates,
                  published_run_for_date, save_news_cache, stage_rows_for_run,
                  market_rows_for_run, market_environment_for_run)
 from .db import (reviews_for_date, save_manual_review, get_profile_cache, save_profile_cache,
                  get_fundamental_cache, save_fundamental_cache)
+from .db import (finish_background_refresh, latest_background_refresh,
+                 recover_interrupted_refreshes,
+                 set_background_refresh_pid, start_background_refresh)
 from .datasource import AKShareSource
 from .profile import build_profile
-from .sync import DataValidationError, resolve_latest_completed_trade_date, sync_market_day
 
-app = FastAPI(title="A股低位多涨停筛选器", version="0.8.1")
+app = FastAPI(title="A股低位多涨停筛选器", version="0.8.2")
 app.mount("/static",StaticFiles(directory=str(Path(__file__).parent / "static")),name="static")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 security = HTTPBasic(auto_error=False)
@@ -78,6 +83,27 @@ def auth(credentials: Optional[HTTPBasicCredentials] = Depends(security)) -> Non
 @app.on_event("startup")
 def _startup() -> None:
     init_db()
+    recover_interrupted_refreshes(_pid_alive)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid,0)
+        return True
+    except (OSError,ValueError):
+        return False
+
+
+def _launch_refresh_job(job_id: int, trade_date: str) -> int:
+    """Start a detached scan process and return immediately."""
+    env=os.environ.copy(); env["DB_PATH"]=settings.db_path
+    process=subprocess.Popen(
+        [sys.executable,"-m","app.refresh_worker",str(job_id),trade_date],
+        cwd=str(PROJECT_ROOT),env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    set_background_refresh_pid(job_id,process.pid)
+    return process.pid
 
 
 def _rows_for_date(trade_date: str) -> list[dict]:
@@ -164,6 +190,7 @@ def index(request: Request, date: Optional[str] = None):
     review_counts["reviewed"]=len(market_rows)-review_counts["UNSET"]
     environment=market_environment_for_run(int(selected["run_id"])) if selected else None
     warning_type=_warning_type(selected); warning_label=WARNING_LABELS.get(warning_type)
+    background_job=latest_background_refresh()
     market_complete=bool(selected and selected["status"]=="SUCCESS" and selected["akshare_status"]=="SUCCESS")
     board_stats={"first":sum(r["consecutive_boards"]<=1 for r in market_rows),
                  "two":sum(r["consecutive_boards"]==2 for r in market_rows),
@@ -185,6 +212,7 @@ def index(request: Request, date: Optional[str] = None):
             "warning_type":warning_type,"warning_label":warning_label,"market_complete":market_complete,
             "review_counts":review_counts,"review_reasons":sorted(REASONS),
             "reviews":reviews,
+            "background_job":dict(background_job) if background_job else None,
             "chosen_date": chosen,
             "selected":dict(selected) if selected else None,
             "active":dict(active) if active else None,
@@ -213,19 +241,28 @@ def api_results(date: Optional[str] = None):
 @app.post("/api/refresh", dependencies=[Depends(auth)])
 def refresh_latest(date: Optional[str] = None):
     if not refresh_lock.acquire(blocking=False):
-        return JSONResponse({"ok":False,"message":"数据正在抓取，请稍候。"},status_code=409)
+        return JSONResponse({"ok":False,"message":"已有后台任务正在启动，请稍候。"},status_code=409)
     try:
         trade_date=(date or (published_dates()[-1] if published_dates() else None))
         if not trade_date or len(trade_date.replace("-","")) != 8:
             return JSONResponse({"ok":False,"message":"请先选择日期。"},status_code=400)
         trade_date=trade_date.replace("-","")
-        sync_market_day(trade_date,run_scan=True,force=True)
-        run=published_run_for_date(trade_date)
-        if not run:
-            return JSONResponse({"ok":False,"message":"关键数据缺失，本次未生成可信复盘结果。"},status_code=503)
-        return {"ok":True,"trade_date":trade_date,"status":run["status"]}
-    except DataValidationError as exc:
-        return JSONResponse({"ok":False,"message":str(exc)},status_code=400)
+        now=datetime.now(ZoneInfo(settings.timezone)); today=now.strftime("%Y%m%d")
+        if not is_trade_date(trade_date):
+            return JSONResponse({"ok":False,"message":f"{trade_date} 为A股休市日，不能生成盘后复盘。"},status_code=400)
+        if trade_date>today or (trade_date==today and now.hour<settings.publish_after_hour):
+            return JSONResponse({"ok":False,"message":f"{trade_date} 尚非完整盘后交易日。"},status_code=400)
+        try:
+            job_id=start_background_refresh(trade_date)
+        except RuntimeError as exc:
+            return JSONResponse({"ok":False,"message":str(exc)},status_code=409)
+        try:
+            _launch_refresh_job(job_id,trade_date)
+        except Exception as exc:
+            finish_background_refresh(job_id,"FAILED",f"后台进程启动失败: {type(exc).__name__}: {exc}")
+            return JSONResponse({"ok":False,"message":"后台任务启动失败，请查看技术详情。",
+                                 "detail":str(exc)},status_code=503)
+        return JSONResponse({"ok":True,"status":"RUNNING","trade_date":trade_date,"job_id":job_id},status_code=202)
     except Exception as exc:
         return JSONResponse({"ok":False,"message":"重新抓取失败，请稍后再试或检查行情网络直连设置。",
                              "detail":f"{type(exc).__name__}: {exc}"},status_code=503)
@@ -233,18 +270,41 @@ def refresh_latest(date: Optional[str] = None):
         refresh_lock.release()
 
 
+@app.get("/api/refresh-status", dependencies=[Depends(auth)])
+def refresh_status():
+    job=latest_background_refresh()
+    if job and job["status"]=="RUNNING" and job["worker_pid"] and not _pid_alive(int(job["worker_pid"])):
+        recover_interrupted_refreshes(_pid_alive)
+        job=latest_background_refresh()
+    if not job:
+        return {"running":False,"trade_date":None,"started_at":None,"status":"IDLE","message":""}
+    data=dict(job)
+    return {"running":data["status"]=="RUNNING","trade_date":data["trade_date"],
+            "started_at":data["started_at"],"finished_at":data["finished_at"],
+            "status":data["status"],"message":data["message"] or "","job_id":data["job_id"]}
+
+
+def current_news_allowed(as_of_date: str, now: datetime | None=None) -> bool:
+    """Current-news feeds are safe only on today's completed trading page."""
+    now=now or datetime.now(ZoneInfo(settings.timezone))
+    if now.tzinfo is None:
+        now=now.replace(tzinfo=ZoneInfo(settings.timezone))
+    else:
+        now=now.astimezone(ZoneInfo(settings.timezone))
+    today=now.strftime("%Y%m%d")
+    return (as_of_date==today and now.hour>=settings.publish_after_hour and
+            is_trade_date(today))
+
+
 @app.get("/api/news/{symbol}", dependencies=[Depends(auth)])
 def news(symbol: str, as_of_date: Optional[str]=None):
     symbol=str(symbol).zfill(6)
-    if as_of_date:
-        as_of_date=as_of_date.replace("-","")
-        dates=published_dates()
-        try: latest=resolve_latest_completed_trade_date()
-        except Exception: latest=dates[-1] if dates else None
-        if latest and as_of_date<latest:
-            return {"symbol":symbol,"as_of_date":as_of_date,"withheld":True,"items":[],
-                    "message":"为避免未来信息影响历史复盘，本日期不展示当前资讯。"}
-    query_date=datetime.now(ZoneInfo(settings.timezone)).strftime("%Y%m%d")
+    now=datetime.now(ZoneInfo(settings.timezone))
+    as_of_date=(as_of_date or now.strftime("%Y%m%d")).replace("-","")
+    if not current_news_allowed(as_of_date,now):
+        return {"symbol":symbol,"as_of_date":as_of_date,"withheld":True,"items":[],
+                "message":"为避免未来信息影响复盘，仅当日盘后页面展示当前资讯。"}
+    query_date=now.strftime("%Y%m%d")
     cached=get_news_cache(symbol,query_date)
     if cached:
         return {"symbol":symbol,"cached":True,"items":json.loads(cached["news_json"])}

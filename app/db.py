@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -64,7 +65,8 @@ CREATE TABLE IF NOT EXISTS scan_runs (
  akshare_status TEXT, history_status TEXT, current_time TEXT,
  pool_rows INTEGER DEFAULT 0, cap_rows INTEGER DEFAULT 0, repeated_rows INTEGER DEFAULT 0,
  nonconsecutive_rows INTEGER DEFAULT 0, low_rows INTEGER DEFAULT 0, pullback_rows INTEGER DEFAULT 0,
- pattern_rows INTEGER DEFAULT 0, candidate_rows INTEGER DEFAULT 0, warning_type TEXT);
+ pattern_rows INTEGER DEFAULT 0, candidate_rows INTEGER DEFAULT 0, warning_type TEXT,
+ owner_pid INTEGER);
 CREATE INDEX IF NOT EXISTS idx_scan_runs_date ON scan_runs(trade_date,run_id);
 CREATE TABLE IF NOT EXISTS published_snapshots (
  trade_date TEXT PRIMARY KEY, run_id INTEGER NOT NULL, published_at TEXT NOT NULL);
@@ -123,6 +125,11 @@ CREATE TABLE IF NOT EXISTS stock_fundamental_cache (
  revenue REAL, revenue_yoy REAL, net_profit REAL, net_profit_yoy REAL,
  profit_status TEXT, source TEXT NOT NULL, fetched_at TEXT NOT NULL,
  PRIMARY KEY(symbol,as_of_date));
+CREATE TABLE IF NOT EXISTS background_refresh_jobs (
+ job_id INTEGER PRIMARY KEY AUTOINCREMENT, trade_date TEXT NOT NULL,
+ status TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
+ message TEXT, worker_pid INTEGER);
+CREATE INDEX IF NOT EXISTS idx_refresh_jobs_status ON background_refresh_jobs(status,job_id);
 """
 
 
@@ -162,6 +169,9 @@ def init_db() -> None:
             table_cols={r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
             if "warning_type" not in table_cols:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN warning_type TEXT")
+        scan_cols={r[1] for r in conn.execute("PRAGMA table_info(scan_runs)")}
+        if "owner_pid" not in scan_cols:
+            conn.execute("ALTER TABLE scan_runs ADD COLUMN owner_pid INTEGER")
         review_cols={r[1] for r in conn.execute("PRAGMA table_info(manual_reviews)")}
         if "review_timing" not in review_cols:
             conn.execute("ALTER TABLE manual_reviews ADD COLUMN review_timing TEXT NOT NULL DEFAULT 'HINDSIGHT'")
@@ -277,11 +287,16 @@ def latest_successful_run():
 
 def start_scan_run(trade_date: str, current_time: str) -> int:
     init_db()
-    with connect() as conn:
-        conn.execute("INSERT INTO scan_runs(trade_date,status,started_at,current_time,message) VALUES(?,?,?,?,?)",
-                     (trade_date,"RUNNING",utcnow(),current_time,"正在重新抓取"))
+    with transaction() as conn:
+        job=conn.execute("SELECT trade_date,worker_pid FROM background_refresh_jobs WHERE status='RUNNING' ORDER BY job_id DESC LIMIT 1").fetchone()
+        if job and int(job["worker_pid"] or -1)!=os.getpid():
+            raise RuntimeError(f"{job['trade_date']} 后台扫描正在运行")
+        active=conn.execute("SELECT trade_date FROM scan_runs WHERE status='RUNNING' ORDER BY run_id DESC LIMIT 1").fetchone()
+        if active:
+            raise RuntimeError(f"{active['trade_date']} 扫描正在运行")
+        conn.execute("INSERT INTO scan_runs(trade_date,status,started_at,current_time,message,owner_pid) VALUES(?,?,?,?,?,?)",
+                     (trade_date,"RUNNING",utcnow(),current_time,"正在重新抓取",os.getpid()))
         run_id=conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.commit()
     mark_pipeline_start(trade_date)
     return int(run_id)
 
@@ -297,6 +312,76 @@ def active_run_for_date(trade_date: str):
     init_db()
     with connect() as conn:
         return conn.execute("SELECT * FROM scan_runs WHERE trade_date=? ORDER BY run_id DESC LIMIT 1",(trade_date,)).fetchone()
+
+
+def start_background_refresh(trade_date: str) -> int:
+    """Atomically reserve the single web refresh slot across processes."""
+    init_db()
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        active=conn.execute("SELECT * FROM background_refresh_jobs WHERE status='RUNNING' ORDER BY job_id DESC LIMIT 1").fetchone()
+        if active:
+            conn.rollback()
+            raise RuntimeError(f"{active['trade_date']} 正在后台生成，请完成后再生成其他日期。")
+        conn.execute("INSERT INTO background_refresh_jobs(trade_date,status,started_at,message) VALUES(?,?,?,?)",
+                     (trade_date,"RUNNING",utcnow(),"正在后台生成"))
+        job_id=int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        conn.commit()
+        return job_id
+
+
+def set_background_refresh_pid(job_id: int, pid: int) -> None:
+    with connect() as conn:
+        conn.execute("UPDATE background_refresh_jobs SET worker_pid=? WHERE job_id=? AND status='RUNNING'",(pid,job_id))
+        conn.commit()
+
+
+def finish_background_refresh(job_id: int, status: str, message: str) -> None:
+    if status not in {"SUCCESS","WARNING","FAILED","INTERRUPTED"}:
+        raise ValueError(f"invalid background refresh status: {status}")
+    with connect() as conn:
+        conn.execute("UPDATE background_refresh_jobs SET status=?,finished_at=?,message=? WHERE job_id=?",
+                     (status,utcnow(),message,job_id))
+        conn.commit()
+
+
+def latest_background_refresh():
+    init_db()
+    with connect() as conn:
+        return conn.execute("SELECT * FROM background_refresh_jobs ORDER BY job_id DESC LIMIT 1").fetchone()
+
+
+def running_background_refresh():
+    init_db()
+    with connect() as conn:
+        return conn.execute("SELECT * FROM background_refresh_jobs WHERE status='RUNNING' ORDER BY job_id DESC LIMIT 1").fetchone()
+
+
+def recover_interrupted_refreshes(pid_alive) -> list[int]:
+    """Fail RUNNING jobs whose worker no longer exists, preserving published snapshots."""
+    init_db(); interrupted=[]; now=utcnow()
+    with transaction() as conn:
+        jobs=conn.execute("SELECT * FROM background_refresh_jobs WHERE status='RUNNING'").fetchall()
+        live_dates=set()
+        for job in jobs:
+            pid=job["worker_pid"]
+            if pid and pid_alive(int(pid)):
+                live_dates.add(job["trade_date"])
+                continue
+            message="上次后台生成因服务中断未完成，可重新生成。"
+            conn.execute("UPDATE background_refresh_jobs SET status='INTERRUPTED',finished_at=?,message=? WHERE job_id=?",
+                         (now,message,job["job_id"]))
+            conn.execute("UPDATE scan_runs SET status='FAILED',finished_at=?,message=? WHERE trade_date=? AND status='RUNNING'",
+                         (now,message,job["trade_date"]))
+            interrupted.append(int(job["job_id"]))
+        # Pre-V0.8.2 orphans have no job record and cannot be resumed safely.
+        running_runs=conn.execute("SELECT run_id,trade_date,owner_pid FROM scan_runs WHERE status='RUNNING'").fetchall()
+        for run in running_runs:
+            owner=run["owner_pid"]
+            if run["trade_date"] not in live_dates and (not owner or not pid_alive(int(owner))):
+                conn.execute("UPDATE scan_runs SET status='FAILED',finished_at=?,message=? WHERE run_id=?",
+                             (now,"上次后台生成因服务中断未完成，可重新生成。",run["run_id"]))
+    return interrupted
 
 
 def published_dates() -> list[str]:

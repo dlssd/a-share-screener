@@ -1,9 +1,13 @@
+import threading
+import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from fastapi.testclient import TestClient
 
 from app import db
 from app.config import settings
 from app.datasource import AKShareSource
-from app.sync import DataValidationError
 from app.web import app, refresh_lock
 import app.web as web_module
 
@@ -35,7 +39,7 @@ def test_zero_candidates_still_shows_review_stages(tmp_path):
         try:
             busy=TestClient(app).post("/api/refresh")
             assert busy.status_code==409
-            assert busy.json()["message"]=="数据正在抓取，请稍候。"
+            assert "后台任务" in busy.json()["message"]
         finally:
             refresh_lock.release()
     finally:
@@ -50,30 +54,28 @@ def test_refresh_uses_browsed_date_and_news_is_cached(tmp_path, monkeypatch):
             run=db.start_scan_run(date,"now")
             db.finish_scan_run(run,date,"WARNING","ok",{"candidate_rows":0},"WARNING","SUCCESS","now",[])
         called=[]
-        def fake_sync(date,run_scan=True,force=False):
-            called.append((date,force))
-        monkeypatch.setattr(web_module,"sync_market_day",fake_sync)
+        monkeypatch.setattr(web_module,"is_trade_date",lambda date:True)
+        monkeypatch.setattr(web_module,"_launch_refresh_job",lambda job_id,date:(called.append(date) or 12345))
         response=TestClient(app).post("/api/refresh?date=20260923")
-        assert response.status_code==200
-        assert called==[("20260923",True)]
+        assert response.status_code==202 and response.json()["status"]=="RUNNING"
+        assert called==["20260923"]
+        db.finish_background_refresh(response.json()["job_id"],"SUCCESS","done")
         response=TestClient(app).post("/api/refresh?date=20260924")
-        assert response.status_code==200
-        assert called[-1]==("20260924",True)
+        assert response.status_code==202 and called[-1]=="20260924"
+        db.finish_background_refresh(response.json()["job_id"],"SUCCESS","done")
 
         calls=[]
         def fake_news(self,symbol):
             calls.append(symbol)
             return [{"title":"测试新闻","published_at":"2026-09-24 20:00","source":"测试来源"}]
         monkeypatch.setattr(AKShareSource,"news",fake_news)
-        first=TestClient(app).get("/api/news/601567")
-        second=TestClient(app).get("/api/news/601567")
+        monkeypatch.setattr(web_module,"current_news_allowed",lambda *args,**kwargs:True)
+        first=TestClient(app).get("/api/news/601567?as_of_date=20260924")
+        second=TestClient(app).get("/api/news/601567?as_of_date=20260924")
         assert first.status_code==200 and second.status_code==200
         assert first.json()["items"]==second.json()["items"]
         assert calls==["601567"]
 
-        def reject_future(date,run_scan=True,force=False):
-            raise DataValidationError("20270101 尚非完整盘后交易日")
-        monkeypatch.setattr(web_module,"sync_market_day",reject_future)
         future=TestClient(app).post("/api/refresh?date=20270101")
         assert future.status_code==400
     finally:
@@ -214,15 +216,120 @@ def test_historical_news_is_withheld_but_latest_news_still_loads(tmp_path, monke
             run=db.start_scan_run(date,"now")
             db.finish_scan_run(run,date,"SUCCESS","ok",{},"SUCCESS","SUCCESS","now",[])
         calls=[]
-        monkeypatch.setattr(web_module,"resolve_latest_completed_trade_date",lambda:"20260924")
         monkeypatch.setattr(AKShareSource,"news",lambda self,symbol:(calls.append(symbol) or
             [{"title":"09-24新闻","published_at":"2026-09-24 10:00","source":"测试"}]))
         client=TestClient(app)
         historical=client.get("/api/news/601567?as_of_date=20260921")
         assert historical.status_code==200 and historical.json()["withheld"] is True
         assert historical.json()["items"]==[] and calls==[]
+        monkeypatch.setattr(web_module,"current_news_allowed",lambda date,now=None:date=="20260924")
         latest=client.get("/api/news/601567?as_of_date=20260924")
         assert latest.status_code==200 and latest.json()["items"][0]["published_at"].startswith("2026-09-24")
         assert calls==["601567"]
+    finally:
+        object.__setattr__(settings,"db_path",original)
+
+
+def test_news_requires_today_trade_day_after_publish_hour(monkeypatch):
+    tz=ZoneInfo("Asia/Shanghai")
+    monkeypatch.setattr(web_module,"is_trade_date",lambda date:date=="20260928")
+    assert not web_module.current_news_allowed("20260925",datetime(2026,9,26,20,tzinfo=tz))  # 周六看周五
+    assert not web_module.current_news_allowed("20260925",datetime(2026,9,28,10,tzinfo=tz))  # 周一上午看周五
+    assert web_module.current_news_allowed("20260928",datetime(2026,9,28,20,tzinfo=tz))
+    assert not web_module.current_news_allowed("20260921",datetime(2026,9,28,20,tzinfo=tz))
+
+
+def test_background_refresh_is_immediate_and_pages_remain_responsive(tmp_path, monkeypatch):
+    original=settings.db_path; object.__setattr__(settings,"db_path",str(tmp_path/"async.db"))
+    try:
+        db.init_db(); run=db.start_scan_run("20260924","now")
+        db.finish_scan_run(run,"20260924","SUCCESS","ok",{},"SUCCESS","SUCCESS","now",[])
+        launched=threading.Event()
+        def fake_launch(job_id,date):
+            launched.set(); return 77777
+        monkeypatch.setattr(web_module,"_launch_refresh_job",fake_launch)
+        monkeypatch.setattr(web_module,"is_trade_date",lambda date:True)
+        monkeypatch.setattr(web_module,"previous_trade_date",lambda date:"20260917")
+        monkeypatch.setattr(web_module,"next_trade_date",lambda date:"20260921")
+        monkeypatch.setattr(web_module,"month_days",lambda month:[{"date":"20260918","is_trade":True},{"date":"20260924","is_trade":True}])
+        client=TestClient(app); started=time.monotonic()
+        response=client.post("/api/refresh?date=20260918")
+        assert response.status_code==202 and time.monotonic()-started<0.5 and launched.is_set()
+        assert client.get("/?date=20260924").status_code==200
+        assert client.get("/?date=20260918").status_code==200
+        assert client.get("/healthz").status_code==200
+        status=client.get("/api/refresh-status").json()
+        assert status["running"] and status["trade_date"]=="20260918"
+        second=client.post("/api/refresh?date=20260915")
+        assert second.status_code==409 and "20260918 正在后台生成" in second.json()["message"]
+    finally:
+        object.__setattr__(settings,"db_path",original)
+
+
+def test_background_worker_finishes_after_user_leaves_and_publishes(tmp_path, monkeypatch):
+    from app import refresh_worker
+    original=settings.db_path; object.__setattr__(settings,"db_path",str(tmp_path/"worker.db"))
+    try:
+        db.init_db(); job=db.start_background_refresh("20260918")
+        def fake_sync(date,run_scan=True,force=False):
+            run=db.start_scan_run(date,"now")
+            db.finish_scan_run(run,date,"WARNING","historical",{},"WARNING","SUCCESS","now",[])
+        monkeypatch.setattr(refresh_worker,"sync_market_day",fake_sync)
+        thread=threading.Thread(target=refresh_worker.run,args=(job,"20260918")); thread.start()
+        assert TestClient(app).get("/healthz").status_code==200
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert db.published_run_for_date("20260918")["status"]=="WARNING"
+        assert db.latest_background_refresh()["status"]=="WARNING"
+    finally:
+        object.__setattr__(settings,"db_path",original)
+
+
+def test_failed_background_worker_keeps_old_snapshot_and_manual_review(tmp_path, monkeypatch):
+    from app import refresh_worker
+    original=settings.db_path; object.__setattr__(settings,"db_path",str(tmp_path/"worker-fail.db"))
+    try:
+        db.init_db(); old=db.start_scan_run("20260924","now")
+        db.finish_scan_run(old,"20260924","SUCCESS","old",{},"SUCCESS","SUCCESS","now",[])
+        with db.connect() as conn:
+            now=db.utcnow(); conn.execute("INSERT INTO manual_reviews VALUES(?,?,?,?,?,?,?,?)",
+                ("20260924","601567","FOCUS","[]","等回调",now,now,"HINDSIGHT")); conn.commit()
+        job=db.start_background_refresh("20260924")
+        monkeypatch.setattr(refresh_worker,"sync_market_day",lambda *args,**kwargs:(_ for _ in ()).throw(RuntimeError("network down")))
+        refresh_worker.run(job,"20260924")
+        assert db.latest_background_refresh()["status"]=="FAILED"
+        assert db.published_run_for_date("20260924")["run_id"]==old
+        assert db.reviews_for_date("20260924")["601567"]["note"]=="等回调"
+    finally:
+        object.__setattr__(settings,"db_path",original)
+
+
+def test_startup_recovers_dead_background_job_without_losing_snapshot(tmp_path, monkeypatch):
+    original=settings.db_path; object.__setattr__(settings,"db_path",str(tmp_path/"recover.db"))
+    try:
+        db.init_db(); first=db.start_scan_run("20260924","now")
+        db.finish_scan_run(first,"20260924","SUCCESS","old",{},"SUCCESS","SUCCESS","now",[])
+        stale=db.start_scan_run("20260924","now")
+        job=db.start_background_refresh("20260924"); db.set_background_refresh_pid(job,99999999)
+        monkeypatch.setattr(web_module,"_pid_alive",lambda pid:False)
+        web_module._startup()
+        assert db.latest_background_refresh()["status"]=="INTERRUPTED"
+        assert db.active_run_for_date("20260924")["status"]=="FAILED"
+        assert db.published_run_for_date("20260924")["run_id"]==first
+    finally:
+        object.__setattr__(settings,"db_path",original)
+
+
+def test_static_assets_and_dashboard_are_served(tmp_path, monkeypatch):
+    original=settings.db_path; object.__setattr__(settings,"db_path",str(tmp_path/"assets.db"))
+    try:
+        db.init_db(); monkeypatch.setattr(web_module,"is_trade_date",lambda date:False)
+        monkeypatch.setattr(web_module,"previous_trade_date",lambda date:None)
+        monkeypatch.setattr(web_module,"next_trade_date",lambda date:None)
+        monkeypatch.setattr(web_module,"month_days",lambda month:[])
+        client=TestClient(app)
+        assert client.get("/?date=20260926").status_code==200
+        for path in ("/static/app.css","/static/review.js","/static/refresh.js","/static/echarts.min.js"):
+            assert client.get(path).status_code==200
     finally:
         object.__setattr__(settings,"db_path",original)

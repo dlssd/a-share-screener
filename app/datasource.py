@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import socket
 import signal
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -10,6 +11,8 @@ from typing import Callable
 import pandas as pd
 
 from .config import settings
+
+_REQUESTS_PATCH_LOCK = threading.RLock()
 
 
 class DataSourceError(RuntimeError):
@@ -65,19 +68,23 @@ def _requests_timeout(seconds: float):
     environment or the user's system/VPN configuration.
     """
     import requests
-    original = requests.sessions.Session.request
+    # AKShare does not consistently expose a timeout/session argument.  Keep
+    # its compatibility shim serialized inside this process; full scans run in
+    # a separate process, so this never blocks ordinary FastAPI page requests.
+    with _REQUESTS_PATCH_LOCK:
+        original = requests.sessions.Session.request
 
-    def request(session, method, url, **kwargs):
-        if settings.market_data_direct:
-            session.trust_env = False
-        kwargs.setdefault("timeout", seconds)
-        return original(session, method, url, **kwargs)
+        def request(session, method, url, **kwargs):
+            if settings.market_data_direct:
+                session.trust_env = False
+            kwargs.setdefault("timeout", seconds)
+            return original(session, method, url, **kwargs)
 
-    requests.sessions.Session.request = request
-    try:
-        yield
-    finally:
-        requests.sessions.Session.request = original
+        requests.sessions.Session.request = request
+        try:
+            yield
+        finally:
+            requests.sessions.Session.request = original
 
 
 def _market_session():
