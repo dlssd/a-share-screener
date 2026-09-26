@@ -66,7 +66,6 @@
 
 <script>window.REVIEW_DATE={{ chosen_date|tojson }};window.HAS_PUBLISHED={{ 'true' if selected else 'false' }};window.REVIEWS={{ reviews|tojson }};window.INDUSTRIES={{ industries[:12]|tojson }};</script>
 <script src="/static/echarts.min.js"></script>
-<script>if(window.echarts&&window.INDUSTRIES.length){const chart=echarts.init(document.getElementById('industryChart'));chart.setOption({grid:{left:100,right:35,top:15,bottom:25},xAxis:{type:'value',minInterval:1},yAxis:{type:'category',inverse:true,data:window.INDUSTRIES.map(x=>x[0])},series:[{type:'bar',data:window.INDUSTRIES.map(x=>x[1]),itemStyle:{color:'#667bb5'},label:{show:true,position:'right'}}]});addEventListener('resize',()=>chart.resize())}</script>
 <script>async function copyText(text){try{await navigator.clipboard.writeText(text)}catch(e){window.prompt('请复制',text)}} async function openNews(symbol,name){return openDetails(symbol,name)}</script>
 <script src="/static/review.js"></script>
 <script src="/static/refresh.js"></script>

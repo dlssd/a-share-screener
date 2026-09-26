@@ -31,7 +31,7 @@ from .db import (finish_background_refresh, latest_background_refresh,
 from .datasource import AKShareSource
 from .profile import build_profile
 
-app = FastAPI(title="A股低位多涨停筛选器", version="0.8.2")
+app = FastAPI(title="A股低位多涨停筛选器", version="0.8.3")
 app.mount("/static",StaticFiles(directory=str(Path(__file__).parent / "static")),name="static")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 security = HTTPBasic(auto_error=False)
@@ -86,12 +86,54 @@ def _startup() -> None:
     recover_interrupted_refreshes(_pid_alive)
 
 
-def _pid_alive(pid: int) -> bool:
+def _windows_pid_alive(pid: int, kernel32=None) -> bool:
+    """Check a Windows process without sending a signal or terminating it."""
+    import ctypes
+    if pid<=0:
+        return False
+    if kernel32 is None:
+        from ctypes import wintypes
+        kernel32=ctypes.WinDLL("kernel32",use_last_error=True)
+        kernel32.OpenProcess.argtypes=(wintypes.DWORD,wintypes.BOOL,wintypes.DWORD)
+        kernel32.OpenProcess.restype=wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes=(wintypes.HANDLE,ctypes.POINTER(wintypes.DWORD))
+        kernel32.GetExitCodeProcess.restype=wintypes.BOOL
+        kernel32.CloseHandle.argtypes=(wintypes.HANDLE,)
+        kernel32.CloseHandle.restype=wintypes.BOOL
+    # PROCESS_QUERY_LIMITED_INFORMATION is enough for a worker owned by the
+    # current user and has no side effects on that process.
+    handle=kernel32.OpenProcess(0x1000,False,pid)
+    if not handle:
+        return False
+    try:
+        exit_code=ctypes.c_ulong()
+        return bool(kernel32.GetExitCodeProcess(handle,ctypes.byref(exit_code)) and exit_code.value==259)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _pid_alive(pid: int, platform_name: str | None=None) -> bool:
+    platform_name=platform_name or os.name
+    if platform_name=="nt":
+        try:
+            return _windows_pid_alive(pid)
+        except (OSError,ValueError):
+            return False
     try:
         os.kill(pid,0)
         return True
     except (OSError,ValueError):
         return False
+
+
+def _worker_process_options(platform_name: str | None=None) -> dict:
+    platform_name=platform_name or os.name
+    if platform_name=="nt":
+        return {"creationflags":(
+            getattr(subprocess,"CREATE_NEW_PROCESS_GROUP",0x00000200) |
+            getattr(subprocess,"CREATE_NO_WINDOW",0x08000000)
+        )}
+    return {"start_new_session":True}
 
 
 def _launch_refresh_job(job_id: int, trade_date: str) -> int:
@@ -100,7 +142,7 @@ def _launch_refresh_job(job_id: int, trade_date: str) -> int:
     process=subprocess.Popen(
         [sys.executable,"-m","app.refresh_worker",str(job_id),trade_date],
         cwd=str(PROJECT_ROOT),env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
-        start_new_session=True,
+        **_worker_process_options(),
     )
     set_background_refresh_pid(job_id,process.pid)
     return process.pid

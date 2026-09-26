@@ -1,5 +1,7 @@
 import threading
 import time
+import os
+from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -333,3 +335,51 @@ def test_static_assets_and_dashboard_are_served(tmp_path, monkeypatch):
             assert client.get(path).status_code==200
     finally:
         object.__setattr__(settings,"db_path",original)
+
+
+def test_posix_pid_alive_and_dead():
+    assert web_module._pid_alive(os.getpid(),"posix") is True
+    assert web_module._pid_alive(99999999,"posix") is False
+
+
+def test_windows_pid_probe_never_uses_os_kill(monkeypatch):
+    calls=[]
+    monkeypatch.setattr(web_module.os,"kill",lambda *args:(_ for _ in ()).throw(AssertionError("unsafe os.kill")))
+    monkeypatch.setattr(web_module,"_windows_pid_alive",lambda pid:(calls.append(pid) or pid==42))
+    assert web_module._pid_alive(42,"nt") is True
+    assert web_module._pid_alive(43,"nt") is False
+    assert calls==[42,43]
+
+
+def test_windows_api_pid_probe_alive_and_dead():
+    class FakeKernel32:
+        def __init__(self): self.closed=[]
+        def OpenProcess(self,access,inherit,pid): return pid if pid in (42,43) else 0
+        def GetExitCodeProcess(self,handle,pointer):
+            pointer._obj.value=259 if handle==42 else 0
+            return 1
+        def CloseHandle(self,handle): self.closed.append(handle)
+    kernel=FakeKernel32()
+    assert web_module._windows_pid_alive(42,kernel) is True
+    assert web_module._windows_pid_alive(43,kernel) is False
+    assert web_module._windows_pid_alive(44,kernel) is False
+    assert kernel.closed==[42,43]
+
+
+def test_worker_subprocess_options_are_platform_specific():
+    posix=web_module._worker_process_options("posix")
+    windows=web_module._worker_process_options("nt")
+    assert posix=={"start_new_session":True}
+    assert "start_new_session" not in windows
+    assert windows["creationflags"] & 0x00000200
+    assert windows["creationflags"] & 0x08000000
+
+
+def test_panorama_chart_is_lazy_and_current_job_offers_refresh():
+    root=Path(__file__).resolve().parents[1]
+    script=(root/"app/static/refresh.js").read_text(encoding="utf-8")
+    template=(root/"app/templates/index.html").read_text(encoding="utf-8")
+    assert "requestAnimationFrame(ensureIndustryChart)" in script
+    assert "else industryChart.resize()" in script
+    assert "新结果已完成" in script and "刷新查看" in script
+    assert "echarts.init" not in template
