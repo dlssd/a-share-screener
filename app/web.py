@@ -28,10 +28,13 @@ from .db import (reviews_for_date, save_manual_review, get_profile_cache, save_p
 from .db import (finish_background_refresh, latest_background_refresh,
                  recover_interrupted_refreshes,
                  set_background_refresh_pid, start_background_refresh)
+from .db import (watchlist_items, get_watchlist_item, save_watchlist_item, update_watchlist_item,
+                 filter_presets, save_filter_preset, rename_filter_preset, delete_filter_preset)
 from .datasource import AKShareSource
 from .profile import build_profile
+from .limit_rules import detect_limit_up_days, theoretical_limit_price, limit_rate
 
-app = FastAPI(title="A股低位多涨停筛选器", version="0.8.3")
+app = FastAPI(title="A股盘后复盘工作台", version="0.9.0")
 app.mount("/static",StaticFiles(directory=str(Path(__file__).parent / "static")),name="static")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 security = HTTPBasic(auto_error=False)
@@ -46,6 +49,27 @@ class ReviewPayload(BaseModel):
     rating: str
     reasons: list[str]=Field(default_factory=list)
     note: str=""
+
+class WatchlistPayload(BaseModel):
+    symbol: str
+    name: str=""
+    added_date: str
+    trigger_price: float
+    trigger_type: str="MANUAL"
+    trigger_reasons: list[str]=Field(default_factory=list)
+    note: str=""
+
+class WatchlistUpdatePayload(BaseModel):
+    status: str
+    note: Optional[str]=None
+
+class PresetPayload(BaseModel):
+    name: str
+    scope: str="BOTH"
+    filters: dict=Field(default_factory=dict)
+
+class PresetRenamePayload(BaseModel):
+    name: str
 WARNING_LABELS={
     "HISTORICAL_REBUILD":"历史重建结果，可能受免费数据源历史覆盖限制",
     "CURRENT_SOURCE_DEGRADED":"当前主数据源异常，已使用降级核验路径",
@@ -195,6 +219,28 @@ def _watch_score(row: dict) -> tuple:
     return failed,low_gap+pullback_gap,-row.get("limit_up_count",0)
 
 
+def _cached_filter_fields(symbol: str, as_of: str) -> dict:
+    """Read-only list enrichment: never causes a market-data request."""
+    profile_row=get_profile_cache(symbol,as_of); fundamental_row=get_fundamental_cache(symbol,as_of)
+    profile=json.loads(profile_row["profile_json"]) if profile_row else None
+    fundamental=dict(fundamental_row) if fundamental_row else None
+    return {"profile":profile,"fundamental":fundamental,"profile_cached":bool(profile),
+            "fundamental_cached":bool(fundamental)}
+
+
+def _watchlist_view(as_of: str) -> list[dict]:
+    result=[]
+    for item in watchlist_items():
+        row={**item,**_cached_filter_fields(item["symbol"],as_of)}
+        profile=row["profile"] or {}; current=profile.get("current_close")
+        row["latest_close"]=current
+        row["return_since_added"]=(current/item["trigger_price"]-1) if current is not None and item["trigger_price"] else None
+        peak=profile.get("high_since_watch")
+        row["drawdown_since_peak"]=(current/peak-1) if current is not None and peak else None
+        result.append(row)
+    return result
+
+
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(auth)])
 def index(request: Request, date: Optional[str] = None):
     dates=published_dates()
@@ -228,6 +274,8 @@ def index(request: Request, date: Optional[str] = None):
     for row in market_rows:
         review=reviews.get(row["symbol"],{"rating":"UNSET","reasons":[],"note":""})
         row["review"]=review
+        row["watchlist"]=get_watchlist_item(row["symbol"])
+        row.update(_cached_filter_fields(row["symbol"],chosen))
     review_counts={rating:sum(r["review"]["rating"]==rating for r in market_rows) for rating in RATINGS}
     review_counts["reviewed"]=len(market_rows)-review_counts["UNSET"]
     environment=market_environment_for_run(int(selected["run_id"])) if selected else None
@@ -245,12 +293,16 @@ def index(request: Request, date: Optional[str] = None):
     for row in market_rows:
         key=row.get("industry") or "行业未知"; industry_counts[key]=industry_counts.get(key,0)+1
     industries=sorted(industry_counts.items(),key=lambda x:(-x[1],x[0]))
+    latest_complete=dates[-1] if dates else chosen
+    watchlist_rows=_watchlist_view(latest_complete)
     return templates.TemplateResponse(
         "index.html",
         {
             "request": request,
             "official":official,"watch":watch,"repeated":repeated,"cap_rows":stages,
             "market_rows":market_rows,"board_stats":board_stats,"industries":industries,"environment":environment,
+            "watchlist_rows":watchlist_rows,"watchlist_count":sum(r["status"]=="ACTIVE" for r in watchlist_rows),
+            "filter_presets":filter_presets(),"watchlist_as_of":latest_complete,
             "warning_type":warning_type,"warning_label":warning_label,"market_complete":market_complete,
             "review_counts":review_counts,"review_reasons":sorted(REASONS),
             "reviews":reviews,
@@ -368,8 +420,72 @@ def save_review(payload: ReviewPayload):
     with connect() as conn:
         exists=conn.execute("""SELECT 1 FROM published_snapshots p JOIN market_limit_results m ON m.run_id=p.run_id
                                WHERE p.trade_date=? AND m.symbol=?""",(trade_date,symbol)).fetchone()
-    if not exists: raise HTTPException(404,"该股票不在所选日期的已识别涨停列表")
+    if not exists and not get_watchlist_item(symbol): raise HTTPException(404,"该股票不在所选日期的已识别涨停列表或观察池")
     return {"ok":True,"review":save_manual_review(trade_date,symbol,rating,payload.reasons,payload.note[:1000])}
+
+
+@app.get("/api/watchlist", dependencies=[Depends(auth)])
+def api_watchlist():
+    dates=published_dates(); as_of=dates[-1] if dates else datetime.now(ZoneInfo(settings.timezone)).strftime("%Y%m%d")
+    return {"as_of_date":as_of,"rows":_watchlist_view(as_of)}
+
+
+@app.post("/api/watchlist", dependencies=[Depends(auth)])
+def add_watchlist(payload: WatchlistPayload):
+    symbol=payload.symbol.zfill(6); added=payload.added_date.replace("-","")
+    allowed={"MANUAL","REPEATED_LIMIT","T_BOARD","LOW_POSITION","HISTORICAL_STRONG_PULLBACK","OTHER"}
+    if len(added)!=8 or not added.isdigit() or payload.trigger_type not in allowed or payload.trigger_price<=0:
+        raise HTTPException(400,"观察池参数无效")
+    with connect() as conn:
+        market=conn.execute("""SELECT m.name FROM published_snapshots p JOIN market_limit_results m ON m.run_id=p.run_id
+                               WHERE p.trade_date=? AND m.symbol=?""",(added,symbol)).fetchone()
+    existing=get_watchlist_item(symbol)
+    if not market and not existing: raise HTTPException(404,"该股票不在所选日期的涨停列表")
+    name=(market["name"] if market else existing["name"]) or payload.name or symbol
+    item=save_watchlist_item(symbol,name,added,payload.trigger_price,payload.trigger_type,
+                             payload.trigger_reasons,"ACTIVE",payload.note[:1000])
+    return {"ok":True,"item":item}
+
+
+@app.patch("/api/watchlist/{symbol}", dependencies=[Depends(auth)])
+def patch_watchlist(symbol: str, payload: WatchlistUpdatePayload):
+    status_value=payload.status.upper()
+    if status_value not in {"ACTIVE","PAUSED","ARCHIVED"}: raise HTTPException(400,"观察状态无效")
+    item=update_watchlist_item(symbol.zfill(6),status_value,None if payload.note is None else payload.note[:1000])
+    if not item: raise HTTPException(404,"观察项不存在")
+    return {"ok":True,"item":item}
+
+
+@app.get("/api/filter-presets", dependencies=[Depends(auth)])
+def get_filter_presets_api(): return {"rows":filter_presets()}
+
+
+@app.post("/api/filter-presets", dependencies=[Depends(auth)])
+def create_filter_preset(payload: PresetPayload):
+    name=payload.name.strip()
+    if not name or len(name)>40 or payload.scope not in {"DAILY_LIMIT","WATCHLIST","BOTH"}: raise HTTPException(400,"模式参数无效")
+    try: return {"ok":True,"item":save_filter_preset(name,payload.scope,payload.filters)}
+    except Exception as exc:
+        if "UNIQUE" in str(exc): raise HTTPException(409,"模式名称已存在")
+        raise
+
+
+@app.patch("/api/filter-presets/{preset_id}", dependencies=[Depends(auth)])
+def patch_filter_preset(preset_id: int, payload: PresetRenamePayload):
+    name=payload.name.strip()
+    if not name or len(name)>40: raise HTTPException(400,"模式名称无效")
+    try: item=rename_filter_preset(preset_id,name)
+    except Exception as exc:
+        if "UNIQUE" in str(exc): raise HTTPException(409,"模式名称已存在")
+        raise
+    if not item: raise HTTPException(404,"模式不存在")
+    return {"ok":True,"item":item}
+
+
+@app.delete("/api/filter-presets/{preset_id}", dependencies=[Depends(auth)])
+def remove_filter_preset(preset_id: int):
+    if not delete_filter_preset(preset_id): raise HTTPException(404,"模式不存在")
+    return {"ok":True}
 
 
 @app.get("/api/details/{symbol}", dependencies=[Depends(auth)])
@@ -378,7 +494,9 @@ def stock_details(symbol: str, date: str):
     with connect() as conn:
         row=conn.execute("""SELECT m.* FROM published_snapshots p JOIN market_limit_results m ON m.run_id=p.run_id
                             WHERE p.trade_date=? AND m.symbol=?""",(as_of,symbol)).fetchone()
-    if not row: raise HTTPException(404,"未找到该日股票记录")
+    watch_item=get_watchlist_item(symbol)
+    if not row and not watch_item: raise HTTPException(404,"未找到该日股票记录")
+    source=AKShareSource(); history=None; raw_history=None
     profile_cached=get_profile_cache(symbol,as_of)
     if profile_cached:
         profile=json.loads(profile_cached["profile_json"])
@@ -389,8 +507,15 @@ def stock_details(symbol: str, date: str):
                          "observation_days":days,"approx_years":round(days/250,1)})
     else:
         try:
-            history=AKShareSource().tencent_history(symbol,"20100101",as_of,adjusted=True)
-            profile=build_profile(history,as_of); save_profile_cache(symbol,as_of,profile,"tencent_qfq")
+            history=source.tencent_history(symbol,"20100101",as_of,adjusted=True)
+            profile=build_profile(history,as_of)
+            values=history.loc[history["trade_date"].astype(str)<=as_of].sort_values("trade_date")
+            if not values.empty:
+                profile["current_close"]=float(values.iloc[-1]["adjusted_close"])
+                if watch_item:
+                    since=values[values["trade_date"].astype(str)>=watch_item["added_date"]]
+                    if not since.empty: profile["high_since_watch"]=float(since["high"].max())
+            save_profile_cache(symbol,as_of,profile,"tencent_qfq")
         except Exception as exc:
             profile={"available":False,"message":"历史画像暂不可用","technical":f"{type(exc).__name__}: {exc}"}
     fundamental_cached=get_fundamental_cache(symbol,as_of)
@@ -398,14 +523,57 @@ def stock_details(symbol: str, date: str):
         fundamental=dict(fundamental_cached); fundamental["available"]=True
     else:
         try:
-            fundamental=AKShareSource().fundamental_summary(symbol,as_of)
+            fundamental=source.fundamental_summary(symbol,as_of)
             save_fundamental_cache(symbol,as_of,fundamental,"eastmoney_financial_indicator_em")
             fundamental={**fundamental,"available":True}
         except Exception as exc:
             fundamental={"available":False,"message":"基本面暂不可用","technical":f"{type(exc).__name__}: {exc}"}
-    item=dict(row); item["limit_dates"]=json.loads(item.pop("limit_dates_json"))
+    if row:
+        item=dict(row); item["limit_dates"]=json.loads(item.pop("limit_dates_json"))
+    else:
+        with connect() as conn: industry=conn.execute("SELECT industry FROM stock_industry_cache WHERE symbol=?",(symbol,)).fetchone()
+        item={"symbol":symbol,"name":watch_item["name"],"industry":industry["industry"] if industry else None,
+              "total_market_cap_yi":None,"board_label":None,"limit_dates":[]}
+    kline={"available":False,"message":"K线暂不可用","bars":[],"events":[],"volume_events":[]}
+    try:
+        if history is None: history=source.tencent_history(symbol,"20100101",as_of,adjusted=True)
+        raw_history=source.tencent_history(symbol,"20100101",as_of,adjusted=False)
+        adjusted=history.loc[history["trade_date"].astype(str)<=as_of].sort_values("trade_date").tail(3000).copy()
+        raw=raw_history.loc[raw_history["trade_date"].astype(str)<=as_of].sort_values("trade_date").tail(3000).copy()
+        if not adjusted.empty:
+            profile["current_close"]=float(adjusted.iloc[-1]["adjusted_close"])
+            if watch_item:
+                since=adjusted[adjusted["trade_date"].astype(str)>=watch_item["added_date"]]
+                if not since.empty: profile["high_since_watch"]=float(since["high"].max())
+            save_profile_cache(symbol,as_of,profile,"tencent_qfq")
+        detected=detect_limit_up_days(raw,symbol,item.get("name") or "")
+        raw_by_date={str(r.trade_date):r for r in raw.itertuples()}; limit_dates=set(detected.dates)
+        volume=adjusted["volume"] if "volume" in adjusted else None
+        vol_avg=volume.shift(1).rolling(20).mean() if volume is not None else None
+        events=[]; volume_events=[]; bars=[]
+        for idx,r in adjusted.reset_index(drop=True).iterrows():
+            day=str(r["trade_date"]); vol=None if "volume" not in adjusted or r.get("volume") is None else float(r.get("volume"))
+            bars.append([day,float(r["open"]),float(r["close"]),float(r["low"]),float(r["high"]),vol])
+            if day in limit_dates:
+                raw_r=raw_by_date.get(day); kind="LIMIT"
+                if raw_r is not None:
+                    rate=limit_rate(symbol,item.get("name") or "")
+                    previous=raw.loc[raw["trade_date"].astype(str)<day,"raw_close"]
+                    if rate is not None and not previous.empty:
+                        lp=theoretical_limit_price(float(previous.iloc[-1]),rate)
+                        if float(raw_r.low)<lp-.005 and abs(float(raw_r.close)-lp)<=.0051: kind="T"
+                events.append({"date":day,"type":kind,"label":"T" if kind=="T" else "▲ 涨停"})
+            if vol is not None and vol_avg is not None and idx<len(vol_avg) and vol_avg.iloc[idx] and vol>=float(vol_avg.iloc[idx])*2.5:
+                ratio=vol/float(vol_avg.iloc[idx]); events.append({"date":day,"type":"V","label":"V"})
+                volume_events.append({"date":day,"ratio":round(ratio,2),"close":float(r["close"]),"is_limit":day in limit_dates})
+        if watch_item and watch_item["added_date"]<=as_of: events.append({"date":watch_item["added_date"],"type":"WATCH","label":"★ 关注"})
+        kline={"available":True,"bars":bars,"events":events,"volume_events":list(reversed(volume_events[-30:])),
+               "volume_reliable":bool(volume is not None and volume.notna().any())}
+    except Exception as exc:
+        kline={"available":False,"message":"K线暂不可用","technical":f"{type(exc).__name__}: {exc}","bars":[],"events":[],"volume_events":[]}
     return {"stock":item,"profile":profile,"fundamental":fundamental,
-            "review":reviews_for_date(as_of).get(symbol,{"rating":"UNSET","reasons":[],"note":""})}
+            "review":reviews_for_date(as_of).get(symbol,{"rating":"UNSET","reasons":[],"note":""}),
+            "watchlist":watch_item,"kline":kline}
 
 
 @app.get("/healthz")

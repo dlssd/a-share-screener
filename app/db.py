@@ -130,6 +130,16 @@ CREATE TABLE IF NOT EXISTS background_refresh_jobs (
  status TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
  message TEXT, worker_pid INTEGER);
 CREATE INDEX IF NOT EXISTS idx_refresh_jobs_status ON background_refresh_jobs(status,job_id);
+CREATE TABLE IF NOT EXISTS watchlist (
+ symbol TEXT PRIMARY KEY, name TEXT NOT NULL, added_date TEXT NOT NULL,
+ trigger_price REAL NOT NULL, trigger_type TEXT NOT NULL DEFAULT 'MANUAL',
+ trigger_reason_json TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'ACTIVE',
+ note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_watchlist_status ON watchlist(status,added_date);
+CREATE TABLE IF NOT EXISTS filter_presets (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+ scope TEXT NOT NULL DEFAULT 'BOTH', filters_json TEXT NOT NULL DEFAULT '{}',
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 """
 
 
@@ -539,6 +549,74 @@ def save_fundamental_cache(symbol: str, as_of_date: str, item: Mapping, source: 
         conn.execute("INSERT OR REPLACE INTO stock_fundamental_cache VALUES(?,?,?,?,?,?,?,?,?,?)",
           (symbol,as_of_date,item.get("report_date"),item.get("revenue"),item.get("revenue_yoy"),
            item.get("net_profit"),item.get("net_profit_yoy"),item.get("profit_status"),source,utcnow())); conn.commit()
+
+
+def watchlist_items(include_archived: bool=False) -> list[dict]:
+    init_db()
+    sql="SELECT * FROM watchlist" + ("" if include_archived else " WHERE status!='ARCHIVED'") + " ORDER BY added_date DESC,symbol"
+    with connect() as conn: rows=conn.execute(sql).fetchall()
+    out=[]
+    for row in rows:
+        item=dict(row); item["trigger_reasons"]=json.loads(item.pop("trigger_reason_json")); out.append(item)
+    return out
+
+
+def get_watchlist_item(symbol: str):
+    init_db()
+    with connect() as conn: row=conn.execute("SELECT * FROM watchlist WHERE symbol=?",(symbol,)).fetchone()
+    if not row: return None
+    item=dict(row); item["trigger_reasons"]=json.loads(item.pop("trigger_reason_json")); return item
+
+
+def save_watchlist_item(symbol: str, name: str, added_date: str, trigger_price: float,
+                        trigger_type: str="MANUAL", trigger_reasons: list[str] | None=None,
+                        status: str="ACTIVE", note: str="") -> dict:
+    """Insert once; later scans never replace the original date or trigger price."""
+    init_db(); now=utcnow()
+    with connect() as conn:
+        conn.execute("""INSERT INTO watchlist(symbol,name,added_date,trigger_price,trigger_type,
+          trigger_reason_json,status,note,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)
+          ON CONFLICT(symbol) DO UPDATE SET name=excluded.name,trigger_type=excluded.trigger_type,
+          trigger_reason_json=excluded.trigger_reason_json,status=excluded.status,note=excluded.note,
+          updated_at=excluded.updated_at""",
+          (symbol,name,added_date,trigger_price,trigger_type,json.dumps(trigger_reasons or [],ensure_ascii=False),
+           status,note,now,now)); conn.commit()
+    return get_watchlist_item(symbol)
+
+
+def update_watchlist_item(symbol: str, status: str, note: str | None=None) -> dict | None:
+    init_db(); now=utcnow()
+    with connect() as conn:
+        if note is None: conn.execute("UPDATE watchlist SET status=?,updated_at=? WHERE symbol=?",(status,now,symbol))
+        else: conn.execute("UPDATE watchlist SET status=?,note=?,updated_at=? WHERE symbol=?",(status,note,now,symbol))
+        conn.commit()
+    return get_watchlist_item(symbol)
+
+
+def filter_presets() -> list[dict]:
+    init_db()
+    with connect() as conn: rows=conn.execute("SELECT * FROM filter_presets ORDER BY name COLLATE NOCASE").fetchall()
+    out=[]
+    for row in rows:
+        item=dict(row); item["filters"]=json.loads(item.pop("filters_json")); out.append(item)
+    return out
+
+
+def save_filter_preset(name: str, scope: str, filters: Mapping) -> dict:
+    init_db(); now=utcnow()
+    with connect() as conn:
+        conn.execute("INSERT INTO filter_presets(name,scope,filters_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+                     (name,scope,json.dumps(filters,ensure_ascii=False),now,now)); preset_id=conn.execute("SELECT last_insert_rowid()").fetchone()[0]; conn.commit()
+    return next(item for item in filter_presets() if item["id"]==preset_id)
+
+
+def rename_filter_preset(preset_id: int, name: str) -> dict | None:
+    with connect() as conn: conn.execute("UPDATE filter_presets SET name=?,updated_at=? WHERE id=?",(name,utcnow(),preset_id)); conn.commit()
+    return next((item for item in filter_presets() if item["id"]==preset_id),None)
+
+
+def delete_filter_preset(preset_id: int) -> bool:
+    with connect() as conn: cur=conn.execute("DELETE FROM filter_presets WHERE id=?",(preset_id,)); conn.commit(); return cur.rowcount>0
 
 
 def run_for_date(trade_date: str):

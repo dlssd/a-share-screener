@@ -106,3 +106,22 @@ def test_manual_review_survives_force_style_new_scan_run(tmp_path):
 def test_historical_review_is_marked_hindsight():
     assert db.review_timing("20260921","2026-09-26T02:00:00+00:00")=="HINDSIGHT"
     assert db.review_timing("20260921","2026-09-21T12:00:00+00:00")=="LIVE"
+
+
+def test_watchlist_and_presets_survive_new_scan_runs(tmp_path):
+    original=settings.db_path; object.__setattr__(settings,"db_path",str(tmp_path/"v09.db"))
+    try:
+        db.init_db()
+        item=db.save_watchlist_item("601567","三星电气","20260924",42.3,"T_BOARD",["T字板"])
+        assert item["added_date"]=="20260924" and item["trigger_price"]==42.3
+        run=db.start_scan_run("20260925","now")
+        db.finish_scan_run(run,"20260925","SUCCESS","ok",{},"SUCCESS","SUCCESS","now",[])
+        assert db.get_watchlist_item("601567")["status"]=="ACTIVE"
+        db.update_watchlist_item("601567","PAUSED","等待回调")
+        assert db.get_watchlist_item("601567")["note"]=="等待回调"
+        preset=db.save_filter_preset("低位T字板","BOTH",{"board":"T","position":"3Y30"})
+        assert preset["filters"]["board"]=="T"
+        assert db.rename_filter_preset(preset["id"],"低位T字")["name"]=="低位T字"
+        assert db.delete_filter_preset(preset["id"])
+    finally:
+        object.__setattr__(settings,"db_path",original)
